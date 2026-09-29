@@ -285,10 +285,14 @@ class Xybernetex:
                          "model": report.summary.model, **report.decision})
             second = None
             action = report.decision["action"]
-            if mode == "act" and action in MESSAGES and report.result is not None:
+            if mode == "act" and action in MESSAGES and (report.result is not None or action == "retry"):
                 model = followup_model or self._followups.get("model")
                 follow_agent = guarded.clone(model=model) if model else guarded
-                history = report.result.to_input_list() + [{"role": "user", "content": MESSAGES[action]}]
+                # A run that raised has no transcript: the retry starts from the
+                # original input (the files it changed are still there).
+                before = (report.result.to_input_list() if report.result is not None
+                          else [{"role": "user", "content": run_input}] if isinstance(run_input, str) else list(run_input))
+                history = before + [{"role": "user", "content": MESSAGES[action]}]
                 second = await self._one_turn(follow_agent, history, max_turns, runner_kwargs)
                 report.followup = second.result
                 self._write({"type": "followup_end", "sessionKey": session_key, "action": action,
@@ -379,7 +383,10 @@ class Xybernetex:
         except MaxTurnsExceeded as e:
             return Report(status="failed", error=f"max turns exceeded: {e}"[:200], seconds=round(time.time() - t0, 1),
                           summary=RunSummary(success=False, tool_calls=0, retriable=False, error="max turns exceeded"))
-        except AgentsException as e:
+        except Exception as e:  # noqa: BLE001
+            # The SDK's own failures, and the model API's (a 408 request timeout,
+            # an overloaded provider) that the SDK passes through as they are:
+            # the run died, and a timeout is the death a retry is for.
             error = f"{type(e).__name__}: {e}"[:200]
             return Report(status="failed", error=error, seconds=round(time.time() - t0, 1),
                           summary=RunSummary(success=False, tool_calls=0, retriable=retriable(error), error=error))

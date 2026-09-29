@@ -273,6 +273,24 @@ class AdapterTest(unittest.TestCase):
         gate = [(e["type"], e.get("action"), e.get("waiver")) for e in h.logs if e["type"] in ("tool_gate", "tool_gate_waived")]
         self.assertEqual(gate, [("tool_gate_waived", None, "own_files"), ("tool_gate", "BLOCK_ACTION", None)])
 
+    def test_a_model_api_timeout_is_a_retriable_death_retried_from_the_original_input(self):
+        class TimingOut(ScriptedModel):
+            async def get_response(self, *a, **kw):
+                self.inputs.append(a[1] if len(a) > 1 else kw.get("input"))
+                raise RuntimeError("Error code: 408 - AiError: Request timeout")
+
+        stronger = ScriptedModel([say("Wrapped the text; tests pass.")], name="stronger")
+        h = Harness(followups={"mode": "act", "model": stronger})
+        h.agent = h.agent.clone(model=TimingOut(name="flaky"))
+        report = h.run("Implement wrap() in wrap.py.")
+        self.assertEqual(report.status, "failed")
+        self.assertIn("Request timeout", report.error)
+        self.assertEqual(report.decision["action"], "retry")
+        self.assertEqual(report.followup.final_output, "Wrapped the text; tests pass.")
+        follow_input = stronger.inputs[-1]
+        self.assertEqual(follow_input[0], {"role": "user", "content": "Implement wrap() in wrap.py."})
+        self.assertTrue(str(follow_input[-1]["content"]).startswith(MARKER))
+
     def test_observe_mode_decides_but_starts_nothing(self):
         h = Harness([call("run_command", {"command": "python build.py"}, "c1")], [say("Built.")],
                     followups={"mode": "observe"})
