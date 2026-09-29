@@ -54,7 +54,16 @@ if report.status == "held":                     # a destructive call nobody aske
 ```
 
 `approvals=False` is for headless agents: a hold becomes a block that tells
-the model why and to ask the user. The log (default `~/.xybernetex/events.jsonl`)
+the model why and to ask the user.
+
+One SDK behaviour the adapter covers for you: when a tool has a callable
+`needs_approval`, the SDK consults it only if the model's arguments round-trip
+through the tool's schema unchanged; a parameter with a default that the model
+left out makes the SDK pause for approval on its own, without asking any
+policy. The adapter decides those pauses the way the gate would have (allowed
+calls resume by themselves, blocks are rejected with the reason, real holds
+stay for a person), so tools with optional parameters work the same as any
+other. The log (default `~/.xybernetex/events.jsonl`)
 holds the same entries as the OpenClaw plugin's: tool names, hashes and
 labels, never prompts, files or command text.
 
@@ -70,7 +79,7 @@ experiment run replayed through both implementations, identical results):
 | `core/deaths.py` | deaths behind a reported success | 4 | 198 transcripts |
 | `core/control.py` | the gate: rules, presets, holds, blocks | 33 | 1,402 decisions and log actions |
 | `core/followups.py` | the follow-up prompts and local rule | - | same text as the plugin |
-| `openai_agents/` | the adapter | 7 end-to-end | scripted model through real `Runner.run` |
+| `openai_agents/` | the adapter | 8 end-to-end | scripted model through real `Runner.run` |
 
 Not yet: the policy-service client (remote decisions and outcome signals),
 the report, and the LangGraph adapter. Known gap: the SDK drops the model's

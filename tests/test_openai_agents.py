@@ -17,6 +17,11 @@ from xybernetex.core.followups import MARKER
 from xybernetex.openai_agents import Xybernetex
 
 set_tracing_disabled(True)
+# The local follow-up rule holds out 10% of runs at random (the same rule as the plugin's); the
+# tests want the acting branch every time.
+import functools  # noqa: E402
+import xybernetex.openai_agents as _oa  # noqa: E402
+_oa.decide_local = functools.partial(_oa.decide_local, random=lambda: 0.0)
 
 
 def call(name, args, call_id):
@@ -159,6 +164,51 @@ class AdapterTest(unittest.TestCase):
         self.assertIn("intervention", kinds)
         self.assertIn("followup_end", kinds)
         self.assertEqual([e for e in h.logs if e["type"] == "followup_end"][0]["model"], "stronger")
+
+    def test_an_omitted_default_parameter_does_not_bypass_the_gate(self):
+        # The SDK pauses for approval on its own when the model's arguments don't round-trip
+        # through the tool's schema (here: timeout left at its default) and never asks our
+        # needs_approval. The adapter must still decide those calls.
+        def harness(*turns, **xyb):
+            h = Harness(*turns, **xyb)
+
+            @function_tool
+            def run_command(command: str, timeout: int = 60) -> str:
+                """Run a shell command.
+
+                Args:
+                    command: The command line.
+                    timeout: Seconds before the command is killed.
+                """
+                h.ran.append(command)
+                return "ok"
+
+            h.agent = h.agent.clone(tools=[run_command])
+            return h
+
+        # Blocked: the tool never runs and the model is told why.
+        h = harness([call("run_command", {"command": "rm -rf data"}, "c1")], [say("Done.")], approvals=False)
+        report = h.run("Summarize notes.txt.")
+        self.assertEqual(report.status, "done")
+        self.assertEqual(h.ran, [])
+        self.assertTrue(any("Held by Xybernetex" in o for o in h.tool_outputs(report.result)))
+        self.assertEqual([e["action"] for e in h.logs if e["type"] == "tool_gate"], ["BLOCK_ACTION"])
+        # Allowed: the run resumes by itself and the command executes once.
+        h = harness([call("run_command", {"command": "ls"}, "c1")], [say("Listed.")], approvals=False)
+        report = h.run("List the files.")
+        self.assertEqual(report.status, "done")
+        self.assertEqual(h.ran, ["ls"])
+        self.assertEqual(report.result.final_output, "Listed.")
+        # A genuine hold stays a hold, now with our decision attached for the host.
+        h = harness([call("run_command", {"command": "rm -rf data"}, "c1")], [say("Done.")])
+        report = h.run("Summarize notes.txt.")
+        self.assertEqual(report.status, "held")
+        self.assertEqual([e["action"] for e in h.logs if e["type"] == "tool_gate"], ["REQUEST_USER"])
+        state = report.result.to_state()
+        state.approve(report.interruptions[0])
+        resumed = asyncio.run(h.xyb.resume(h.agent, state, session_key="s"))
+        self.assertEqual(resumed.status, "done")
+        self.assertEqual(h.ran, ["rm -rf data"])
 
     def test_observe_mode_decides_but_starts_nothing(self):
         h = Harness([call("run_command", {"command": "python build.py"}, "c1")], [say("Built.")],

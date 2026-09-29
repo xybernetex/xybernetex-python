@@ -254,6 +254,49 @@ class Xybernetex:
             _agent_var.reset(agent_token)
             _session_var.reset(token)
 
+    @staticmethod
+    def _call_of(item: Any) -> tuple[str | None, str | None, Any]:
+        raw = item.raw_item
+        get = (lambda k: raw.get(k)) if isinstance(raw, dict) else (lambda k: getattr(raw, k, None))
+        return get("name"), get("call_id"), get("arguments")
+
+    async def _settle_sdk_holds(self, agent: Agent, result: Any, kwargs: dict) -> Any:
+        """Decide the holds the SDK raised on its own.
+
+        When a tool has a callable needs_approval, the SDK only consults it if
+        the model's arguments round-trip through the tool's schema unchanged;
+        otherwise (a parameter with a default the model left out, a coerced
+        value) it pauses for approval without asking anyone. Those pauses carry
+        no decision of ours, so they'd reach the host as holds with no reason.
+        Here the gate decides them the way needs_approval would have: allowed
+        calls are approved and the run resumes (the input guardrail re-checks
+        the same cached decision at execution), blocks are rejected with the
+        gate's reason, and a genuine hold stays for a person to decide."""
+        for _ in range(50):  # each pass resumes once; a run pausing this often is not settling
+            pending = list(getattr(result, "interruptions", None) or [])
+            state, settled = None, 0
+            for item in pending:
+                name, call_id, arguments = self._call_of(item)
+                if not name or not call_id or call_id in self._decisions:
+                    continue  # ours (the gate already decided, a person decides next), or not a function call
+                try:
+                    args = json.loads(arguments) if isinstance(arguments, str) and arguments else (arguments or {})
+                except ValueError:
+                    args = {}
+                decision = self._decide(name, args, call_id, getattr(agent, "name", None))
+                if decision.get("require_approval"):
+                    continue  # now a hold with a reason, left for the host
+                state = state or result.to_state()
+                if decision.get("block"):
+                    state.reject(item, rejection_message=decision["block_reason"])
+                else:
+                    state.approve(item)
+                settled += 1
+            if not settled:
+                return result
+            result = await Runner.run(agent, state, **kwargs)
+        return result
+
     async def _one_turn(self, agent: Agent, run_input: Any, max_turns: int | None, runner_kwargs: dict) -> Report:
         t0 = time.time()
         kwargs = dict(runner_kwargs)
@@ -261,6 +304,7 @@ class Xybernetex:
             kwargs["max_turns"] = max_turns
         try:
             result = await Runner.run(agent, run_input, **kwargs)
+            result = await self._settle_sdk_holds(agent, result, kwargs)
         except MaxTurnsExceeded as e:
             return Report(status="failed", error=f"max turns exceeded: {e}"[:200], seconds=round(time.time() - t0, 1),
                           summary=RunSummary(success=False, tool_calls=0, retriable=False, error="max turns exceeded"))
