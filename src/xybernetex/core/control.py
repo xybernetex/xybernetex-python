@@ -229,6 +229,12 @@ class ToolGate:
                         flag: True, "action": "BLOCK_ACTION" if enforced else "WOULD_BLOCK"})
         return {"block": True, "block_reason": reason} if enforced else None
 
+    def _only_own_files(self, event: dict, ctx: dict | None) -> bool:
+        try:
+            return self._authorize(event, ctx) == "own_artifact" and bool(self._owns_files(event, ctx))
+        except Exception:  # noqa: BLE001 - unproven: the hold stands
+            return False
+
     def __call__(self, event: dict, ctx: dict | None = None) -> dict | None:
         event = event or {}
         c = ctx or {}
@@ -239,7 +245,10 @@ class ToolGate:
             self._remember(state.held, planted, self._planted_rule)
             return self._block_from_memory(event, ctx, self._planted_rule, planted_reason(planted), "planted")
         followed = self._follows_hold(state, event, ctx)
-        if followed:
+        # A delete of only the agent's own files, untouched since it made them,
+        # can't be a way around a hold: it loses nothing but the agent's own
+        # content. The rules below still decide it (own_files, if listed).
+        if followed and not self._only_own_files(event, ctx):
             return self._block_from_memory(event, ctx, followed[1], follows_hold_reason(followed[0]), "followsHold")
         # Classified once per event: risk.py judges from the tool name and
         # params, the same inputs every rule for this tool call shares.

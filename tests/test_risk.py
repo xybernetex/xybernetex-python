@@ -128,6 +128,42 @@ class RiskTest(unittest.TestCase):
         for command in ["echo then done", "grep -r else src", "if [ -f a ]; then cat a; fi"]:
             self.assertEqual(classify_shell_command(command), "none", command)
 
+    def test_commands_hidden_in_substitutions_and_shell_strings_are_classified(self):
+        # $(...) and backticks run inside double quotes and unquoted heredocs, and
+        # bash -c / eval run their string; quoting hid all of these before 0.4.2.
+        # Single quotes and quoted heredocs stay literal. Same cases as the plugin.
+        for command, tier in [
+            ("echo \"$(rm -rf data)\"", "destructive"),
+            ("x=\"$(rm -rf data)\"", "destructive"),
+            ("echo \"`rm -rf data`\"", "destructive"),
+            ("echo `rm -rf data`", "destructive"),
+            ("bash -c \"rm -rf data\"", "destructive"),
+            ("sh -c 'rm -rf data'", "destructive"),
+            ("bash -lc 'cd x && rm -rf data'", "destructive"),
+            ("eval \"rm -rf data\"", "destructive"),
+            ("sudo sh -c \"git reset --hard\"", "destructive"),
+            ("cmd /c del /s x", "destructive"),
+            ("pwsh -Command \"Remove-Item x -Recurse\"", "destructive"),
+            ("bash -c \"echo \\\"$(rm -rf data)\\\"\"", "destructive"),
+            ("cat <<EOF\n$(rm -rf data)\nEOF", "destructive"),
+            ("cat <<EOF > n.txt\nit's `rm -rf data`\nEOF", "destructive"),
+            ("bash -c \"git push origin main\"", "sensitive"),
+            ("echo 'rm -rf data'", "none"),
+            ("echo '$(rm -rf data)'", "none"),
+            ("git commit -m \"remove the rm -rf step\"", "none"),
+            ("cat <<'EOF'\n$(rm -rf data)\n`rm x`\nEOF", "destructive"),
+            ("echo \"$((1+2))\"", "none"),
+            ("bash -c \"echo hi\"", "none"),
+            ("bash script.sh", "none"),
+            ("python3 -c \"print(1)\"", "none"),
+            ("cat <<'EOF' > README.md\nRun `rm -rf build` to clean.\nEOF\necho done", "none"),
+            ("echo \"exit=$rc; removed: $([ ! -f x.js ] && echo yes || echo no)\"", "none"),
+            ("cat <<-EOF\n\t$(rm -rf data)\n\tEOF", "destructive"),
+            ("a=$(ls); echo `pwd`", "none"),
+            ("echo \"$(echo \"$(git reset --hard)\")\"", "destructive"),
+        ]:
+            self.assertEqual(classify_shell_command(command), tier, command)
+
     def test_risk_thresholds_are_ordered_and_unknown_never_meets_one(self):
         self.assertTrue(meets_risk_threshold("destructive", "sensitive"))
         self.assertTrue(meets_risk_threshold("sensitive", "sensitive"))

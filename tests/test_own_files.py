@@ -42,9 +42,11 @@ class OwnsFilesTest(unittest.TestCase):
         for cmd in ["rm -r check_kv.py", "rm -rf check_kv.py", "rm --recursive check_kv.py", "rm -d check_kv.py",
                     "rm -rf scratch", "rmdir scratch", "rm scratch",                  # folders never qualify
                     "rm check_kv.py kv.py",                                           # kv.py is the user's
-                    "rm check_kv.py && python3 x.py", "rm check_kv.py && mv a b",   # only read-only company
+                    "rm check_kv.py && mv a b", "rm check_kv.py; git reset --hard",  # only harmless company, no moves
+                    "find . -name x -exec mv {} y ';' ; rm check_kv.py", "rm check_kv.py; git mv a b",
                     "cd sub && rm check_kv.py", "cd .. && rm check_kv.py", "cd /tmp && rm check_kv.py", "ls",
-                    "rm check_kv.py 2>/dev/null", "rm check_kv.py | tee log", "rm $(cat list)",
+                    "rm check_kv.py 2>out.log", "rm check_kv.py > log", "rm $(cat list)", "rm `cat list`",
+                    "echo $(date); rm check_kv.py",
                     "rm check_*.py", "rm ../check_kv.py", "rm ~/check_kv.py", "rm $F", "rm -- -x",
                     "shred check_kv.py", "truncate -s 0 check_kv.py", "git rm check_kv.py"]:
             self.assertFalse(s.owns(cmd), cmd)
@@ -56,8 +58,17 @@ class OwnsFilesTest(unittest.TestCase):
         for cmd, wd in [("rm solve.py", "runs/x"), ("del solve.py", "runs/x"), ("Remove-Item solve.py", "runs/x"),
                         ("Remove-Item -Path solve.py -Force", "runs/x"), ("del /f /q solve.py", "runs/x"),
                         ("cd runs/x && rm solve.py", None), ("cd runs && rm x/solve.py && ls -la", None),
-                        ("rm check_kv.py && ls", None), ("rm check_kv.py; cat out.txt", None), ("rm ../../check_kv.py", "runs/x")]:
+                        ("rm check_kv.py && ls", None), ("rm check_kv.py; cat out.txt", None), ("rm ../../check_kv.py", "runs/x"),
+                        ("python3 check_kv.py; echo \"exit=$?\"; rm check_kv.py && ls check_kv.py 2>&1", None),
+                        ("rm -f check_kv.py 2>/dev/null; exit 0", None), ("rm check_kv.py | tee log", None)]:
             self.assertEqual(s.owns(cmd, wd), not cmd.startswith("rm ../"), (cmd, wd))
+        # Absolute paths: exact matches work, anything else doesn't.
+        s2 = Session().wrote("/root/ws/check.py")
+        self.assertTrue(s2.owns("cd /root/ws && rm check.py"))
+        self.assertTrue(s2.owns("rm check.py", "/root/ws"))
+        self.assertTrue(s2.owns("rm /root/ws/check.py"))
+        self.assertFalse(s2.owns("rm check.py"))
+        self.assertFalse(s2.owns("cd /root && rm check.py"))
         for cmd, wd in [("rm solve.py", None), ("rm solve.py", "runs"), ("rm solve.py", "/abs/runs/x"),
                         ("rm solve.py", "../runs/x"), ("Remove-Item -Recurse solve.py", "runs/x"), ("del /s solve.py", "runs/x")]:
             self.assertFalse(s.owns(cmd, wd), (cmd, wd))
@@ -143,6 +154,16 @@ class GateTest(unittest.TestCase):
         self.assertIsNone(call("rm check_kv.py", "c1"))
         s.ran("mkdir scratch")
         self.assertIn("require_approval", call("rm -rf scratch", "c2"))
+
+    def test_a_held_own_file_can_still_be_deleted_plainly_later(self):
+        s, call, logs = self.gate()
+        s.wrote("check.js")
+        # First attempt hides a command in $(...): not a plain own-file delete, so held and remembered.
+        self.assertTrue(call('rm -f check.js; echo "gone: $([ -f check.js ] || echo yes)"', "c1")["block"])
+        self.assertIsNone(call("rm check.js && ls", "c2"))  # the plain retry is waived
+        self.assertEqual(logs[-1].get("waiver"), "own_files")
+        # A move of the held file is still blocked from memory.
+        self.assertTrue(call("mv check.js elsewhere.js", "c3")["block"])
 
     def test_rules_may_list_own_files(self):
         ToolGate(rules=[{"id": "r", "agentId": "*", "toolName": "*", "riskAtLeast": "destructive", "action": "block",

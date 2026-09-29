@@ -206,12 +206,129 @@ def meets_risk_threshold(tier: str | None, threshold: str) -> bool:
     return tier is not None and _SEVERITY[tier] >= _SEVERITY[threshold]
 
 
-def classify_shell_command(command: Any) -> str:
+# Commands a command line runs that quoting hides from the segments above:
+# `$(...)` and backticks (expanded inside double quotes and unquoted
+# heredocs), and the string handed to `bash -c`, `eval` and the like. Each is
+# classified as a command line of its own; the worst tier wins.
+_SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh", "ash", "fish", "pwsh", "powershell", "cmd"})
+_SHELL_C_FLAG = re.compile(r"^(-[a-z]*c|-command|/c|/k)$", re.I)
+_TOKEN = re.compile(r'"((?:[^"\\]|\\.)*)"|\'([^\']*)\'|(\S+)')
+_HEREDOC = re.compile(r"<<(-?)\s*(['\"]?)([A-Za-z_][\w.-]*)\2")
+_MAX_DEPTH = 3
+
+
+def _balanced(text: str, start: int) -> int:
+    """Index of the ) closing a $( whose body starts at `start` (or len(text))."""
+    depth, quote, i = 1, None, start
+    while i < len(text):
+        c = text[i]
+        if quote:
+            if c == quote:
+                quote = None
+            elif c == "\\" and quote == '"':
+                i += 1
+        elif c in "'\"":
+            quote = c
+        elif c == "\\":
+            i += 1
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return len(text)
+
+
+def _substitutions(text: str, quotes: bool = True) -> list[str]:
+    """$(...) and `...` bodies the shell would run. With quotes=False (an
+    unquoted heredoc body), quote characters are literal text."""
+    out: list[str] = []
+    quote = None
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            i += 1
+            continue
+        if c == "\\":
+            i += 2
+            continue
+        if quotes and c == "'" and quote is None:
+            quote = "'"
+            i += 1
+            continue
+        if quotes and c == '"':
+            quote = None if quote == '"' else '"'
+            i += 1
+            continue
+        if quotes and quote is None and text.startswith("<<", i) and not text.startswith("<<<", i):
+            m = _HEREDOC.match(text, i)
+            if m:
+                line_end = text.find("\n", m.end())
+                body_start = n if line_end == -1 else line_end + 1
+                # The rest of the heredoc's own line is ordinary command text.
+                out.extend(_substitutions(text[m.end():body_start]))
+                end = body_start
+                while end < n:
+                    nl = text.find("\n", end)
+                    line = text[end: n if nl == -1 else nl]
+                    if (line.lstrip("\t") if m.group(1) else line) == m.group(3):
+                        break
+                    end = n if nl == -1 else nl + 1
+                if not m.group(2):  # unquoted delimiter: the body expands
+                    out.extend(_substitutions(text[body_start:end], quotes=False))
+                nl = text.find("\n", end)
+                i = n if nl == -1 else nl + 1
+                continue
+        if text.startswith("$(", i) and not text.startswith("$((", i):
+            j = _balanced(text, i + 2)
+            out.append(text[i + 2:j])
+            i = j + 1
+            continue
+        if c == "`":
+            j = text.find("`", i + 1)
+            j = n if j == -1 else j
+            out.append(text[i + 1:j])
+            i = j + 1
+            continue
+        i += 1
+    return out
+
+
+def _handed_to_shells(command: str) -> list[str]:
+    """The strings given to `bash -c`, `sh -lc`, `pwsh -Command`, `cmd /c` and `eval`."""
+    tokens = [m.group(1).replace('\\"', '"') if m.group(1) is not None else m.group(2) if m.group(2) is not None
+              else m.group(3) for m in _TOKEN.finditer(command)]
+    out: list[str] = []
+    for i, tok in enumerate(tokens):
+        name = _EXT_SUFFIX.sub("", _PATH_PREFIX.sub("", tok.lower()))
+        if name == "eval" and i + 1 < len(tokens):
+            out.append(" ".join(tokens[i + 1:]))
+        elif name in _SHELLS:
+            for j in range(i + 1, min(i + 4, len(tokens))):
+                if _SHELL_C_FLAG.match(tokens[j]):
+                    rest = tokens[j + 1:]
+                    if rest:
+                        out.append(" ".join(rest) if name in ("cmd", "pwsh", "powershell") else rest[0])
+                    break
+                if not tokens[j].startswith("-"):
+                    break
+    return out
+
+
+def classify_shell_command(command: Any, _depth: int = 0) -> str:
     if not isinstance(command, str) or not command.strip():
         return "none"
     tier = "destructive" if SQL_CLIENT.search(command) and SQL_DESTRUCTIVE.search(command) else "none"
     for segment in _segments(command):
         tier = _worst(tier, _classify_segment(segment, command))
+    if _depth < _MAX_DEPTH and tier != "destructive":
+        for inner in _substitutions(command) + _handed_to_shells(command):
+            tier = _worst(tier, classify_shell_command(inner, _depth + 1))
     return tier
 
 

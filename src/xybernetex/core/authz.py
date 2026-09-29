@@ -30,7 +30,11 @@ risk.py this is a heuristic, not a security boundary.
 "own_files" in unlessAuthorization): a plain delete (rm, unlink, del,
 Remove-Item) of single files the agent itself created this session -
 written, added by a patch, redirected to with > - that no move has touched
-since, optionally after a cd and followed by read-only commands (ls, cat).
+since. The same call may cd and run other commands the risk classifier
+rates harmless (python3 check.py; ls), but no move: a script can already
+delete or move files unseen (risk.py can't read inside it), so harmless
+company adds nothing a planted instruction couldn't do anyway, while a
+visible move in the same call could land a user's file on the one deleted.
 Deleting such a file loses only the agent's own content: whatever it
 replaced was already gone when the agent wrote it. Paths are resolved
 against the call's workdir and any cd, and must match exactly - a file made
@@ -143,11 +147,10 @@ _PLAIN_DELETE_FLAG = re.compile(r"^(-f|-v|-fv|-vf|--force|--verbose|-force|/f|/q
 _RECURSIVE_FLAG = re.compile(r"^(-(?=[rfv]*r)[rfv]+|--recursive|-recurse)$", re.I)
 _PATH_FLAG = re.compile(r"^-(path|literalpath)$", re.I)
 _CD_COMMANDS = frozenset({"cd", "chdir", "pushd", "set-location", "sl"})
-_READ_ONLY_COMMANDS = frozenset({"ls", "dir", "cat", "echo", "pwd", "head", "tail", "wc", "true", "type",
-                                 "get-childitem", "gci", "get-content", "gc"})
+_NULL_REDIRECT = re.compile(r"^(\d?>>?|&>)(/dev/null|nul|&\d)$|^\d?>&\d$", re.I)
+_HIDDEN_COMMAND = re.compile(r"`|\$\(")
 _UNSAFE_TARGET = re.compile(r"[*?\[\]{}$`~,]|(^|[/\\])\.\.([/\\]|$)|^-")
 _ABSOLUTE = re.compile(r"^([/\\]|[a-z]:)", re.I)
-_UNSAFE_SHELL = re.compile(r"[<>|`]|\$\(")
 _UNREADABLE_MOVE = re.compile(r"\bxargs\b|\bfind\b.*-exec|\bparallel\b", re.I)
 
 
@@ -169,13 +172,13 @@ def _shell_steps(p: dict) -> list[tuple[str | None, str, list[str], str]] | None
     wd = _first_present(p, "workdir", "cwd")
     cwd: str | None = ""
     if isinstance(wd, str) and wd.strip():
-        cwd = _resolve("", wd.strip()) if not _UNSAFE_TARGET.search(wd.strip()) and not _ABSOLUTE.match(wd.strip()) else None
+        cwd = _resolve("", wd.strip()) if not _UNSAFE_TARGET.search(wd.strip()) else None
     steps = []
     for segment in _split_segments(text):
         cmd, args = _command(segment)
         if cmd in _CD_COMMANDS:
             plain = [a for a in args if not a.startswith("-")]
-            safe = len(plain) == 1 and not _UNSAFE_TARGET.search(plain[0]) and not _ABSOLUTE.match(plain[0])
+            safe = len(plain) == 1 and not _UNSAFE_TARGET.search(plain[0])
             cwd = _resolve(cwd, plain[0]) if cwd is not None and safe else None
             continue
         steps.append((cwd, cmd, args, segment))
@@ -610,6 +613,11 @@ def _creations(tool_name: str, params: Any) -> tuple[list[str], list[str], list[
     return paths, tables, files
 
 
+def _is_move(cmd: str, args: list[str]) -> bool:
+    return (cmd in MOVE_COMMANDS or (cmd == "git" and args[:1] == ["mv"])
+            or (cmd == "rsync" and "--remove-source-files" in args))
+
+
 def _moves(tool_name: str, params: Any) -> tuple[list[str], bool]:
     """The paths a call's visible moves name (sources and destinations, resolved
     against its working folder), and whether it moved things we can't name
@@ -622,8 +630,7 @@ def _moves(tool_name: str, params: Any) -> tuple[list[str], bool]:
     named: list[str] = []
     unreadable = False
     for cwd, cmd, args, segment in steps:
-        if not (cmd in MOVE_COMMANDS or (cmd == "git" and args[:1] == ["mv"])
-                or (cmd == "rsync" and "--remove-source-files" in args)):
+        if not _is_move(cmd, args):
             continue
         plain = [a for a in (args[1:] if cmd == "git" else args) if not a.startswith("-")]
         if (cwd is None or not plain or _UNREADABLE_MOVE.search(segment)
@@ -702,20 +709,29 @@ class AuthorizationTracker:
             return False
         p = _params(params)
         text = _shell_text(p)
-        if text is None or _UNSAFE_SHELL.search(text):
+        if text is None or _HIDDEN_COMMAND.search(text):
             return False
         steps = _shell_steps(p) or []
         deleted = False
-        for cwd, cmd, args, _segment in steps:
-            if cmd in _READ_ONLY_COMMANDS:
+        for cwd, cmd, args, segment in steps:
+            if cmd not in _OWN_DELETE_COMMANDS:
+                # Company: harmless, and never a move (see the module docstring).
+                if (_is_move(cmd, args) or _UNREADABLE_MOVE.search(segment)
+                        or classify_shell_command(segment) != "none"):
+                    return False
                 continue
-            if cmd not in _OWN_DELETE_COMMANDS or cwd is None:
+            if cwd is None:
                 return False
             targets: list[str] = []
             recursive = False
             i = 0
             while i < len(args):
                 a = args[i]
+                if _NULL_REDIRECT.match(a):
+                    i += 1
+                    continue
+                if a.startswith((">", "<")) or a[:1].isdigit() and ">" in a:
+                    return False
                 if _PATH_FLAG.match(a) and i + 1 < len(args):
                     targets.append(args[i + 1])
                     i += 2
