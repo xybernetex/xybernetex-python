@@ -35,15 +35,47 @@ tests/           unittest; the JavaScript plugin's tests are the reference
                  cases, translated so both ports behave identically
 ```
 
+## Usage (OpenAI Agents SDK)
+
+```python
+from xybernetex.openai_agents import Xybernetex
+
+xyb = Xybernetex(mode="enforce", preset="recommended",
+                 followups={"mode": "act", "model": stronger_model})   # or mode="observe"
+report = await xyb.run(agent, "Delete the build folder", session_key="chat-42")
+report.result.final_output   # the SDK's RunResult, as usual
+report.status                # done | died | held | failed
+report.followup              # the follow-up turn's RunResult, if one ran
+
+if report.status == "held":                     # a destructive call nobody asked for
+    state = report.result.to_state()
+    state.approve(report.interruptions[0])      # or state.reject(..., rejection_message=...)
+    report = await xyb.resume(agent, state, session_key="chat-42")
+```
+
+`approvals=False` is for headless agents: a hold becomes a block that tells
+the model why and to ask the user. The log (default `~/.xybernetex/events.jsonl`)
+holds the same entries as the OpenClaw plugin's: tool names, hashes and
+labels, never prompts, files or command text.
+
 ## Status
 
-Scaffold only. Nothing is ported yet. The order of work:
+Ported and cross-checked against the JavaScript on real data (every
+experiment run replayed through both implementations, identical results):
 
-1. `core/risk.py` and `core/authz.py` - the classifier and the who-asked
-   labels, with the plugin's tests translated.
-2. `core/deaths.py` - empty and cut-off answers.
-3. `openai_agents/` - a hook that gates tool calls and reports run ends.
-4. The policy client and follow-up turns.
+| Module | What | Tests | Parity check |
+| --- | --- | --- | --- |
+| `core/risk.py` | what a call does | 11 | 497 shell commands, 1,402 tool calls |
+| `core/authz.py` | who asked; held and planted targets | 27 | 1,402 labels, 1,402 result scans |
+| `core/deaths.py` | deaths behind a reported success | 4 | 198 transcripts |
+| `core/control.py` | the gate: rules, presets, holds, blocks | 33 | 1,402 decisions and log actions |
+| `core/followups.py` | the follow-up prompts and local rule | - | same text as the plugin |
+| `openai_agents/` | the adapter | 7 end-to-end | scripted model through real `Runner.run` |
+
+Not yet: the policy-service client (remote decisions and outcome signals),
+the report, and the LangGraph adapter. Known gap: the SDK drops the model's
+finish reason, so a cut-off answer looks like a short answer; only an empty
+answer is recognized as a death.
 
 ## Development
 
