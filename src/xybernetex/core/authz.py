@@ -142,7 +142,8 @@ _RELATIVE_PREFIX = re.compile(r"^(\.\.?/|~/)+")
 _EXT = re.compile(r"(\.[a-z0-9]{1,6})$", re.I)
 _SENTENCE_END = re.compile(r"[.!?](?=\s|$)|\n+")
 # owns_files: the only commands, flags and target shapes it accepts.
-_OWN_DELETE_COMMANDS = frozenset({"rm", "unlink", "del", "erase", "remove-item", "ri"})
+# trash/trash-put move to the trash: for the agent's own file, a recoverable delete.
+_OWN_DELETE_COMMANDS = frozenset({"rm", "unlink", "del", "erase", "remove-item", "ri", "trash", "trash-put"})
 _PLAIN_DELETE_FLAG = re.compile(r"^(-f|-v|-fv|-vf|--force|--verbose|-force|/f|/q)$", re.I)
 _RECURSIVE_FLAG = re.compile(r"^(-(?=[rfv]*r)[rfv]+|--recursive|-recurse)$", re.I)
 _PATH_FLAG = re.compile(r"^-(path|literalpath)$", re.I)

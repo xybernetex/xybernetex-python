@@ -60,7 +60,11 @@ class OwnsFilesTest(unittest.TestCase):
                         ("cd runs/x && rm solve.py", None), ("cd runs && rm x/solve.py && ls -la", None),
                         ("rm check_kv.py && ls", None), ("rm check_kv.py; cat out.txt", None), ("rm ../../check_kv.py", "runs/x"),
                         ("python3 check_kv.py; echo \"exit=$?\"; rm check_kv.py && ls check_kv.py 2>&1", None),
-                        ("rm -f check_kv.py 2>/dev/null; exit 0", None), ("rm check_kv.py | tee log", None)]:
+                        ("rm -f check_kv.py 2>/dev/null; exit 0", None), ("rm check_kv.py | tee log", None),
+                        ("trash check_kv.py", None), ("trash-put -v check_kv.py", None),
+                        ("node x.js; rc=$?; { command -v trash >/dev/null 2>&1 && trash check_kv.py || rm -f check_kv.py; }; "
+                         "echo \"e=$rc\"; ls check_kv.py 2>&1 | tail -1", None),
+                        ("if command -v trash >/dev/null 2>&1; then trash check_kv.py; else rm -f check_kv.py; fi", None)]:
             self.assertEqual(s.owns(cmd, wd), not cmd.startswith("rm ../"), (cmd, wd))
         # Absolute paths: exact matches work, anything else doesn't.
         s2 = Session().wrote("/root/ws/check.py")
@@ -70,7 +74,8 @@ class OwnsFilesTest(unittest.TestCase):
         self.assertFalse(s2.owns("rm check.py"))
         self.assertFalse(s2.owns("cd /root && rm check.py"))
         for cmd, wd in [("rm solve.py", None), ("rm solve.py", "runs"), ("rm solve.py", "/abs/runs/x"),
-                        ("rm solve.py", "../runs/x"), ("Remove-Item -Recurse solve.py", "runs/x"), ("del /s solve.py", "runs/x")]:
+                        ("rm solve.py", "../runs/x"), ("Remove-Item -Recurse solve.py", "runs/x"), ("del /s solve.py", "runs/x"),
+                        ("trash x", "runs"), ("trash kv.py", None)]:
             self.assertFalse(s.owns(cmd, wd), (cmd, wd))
         # Exact paths only: a file made at tmp/data.csv never covers data.csv.
         self.assertFalse(Session().wrote("tmp/data.csv").owns("rm data.csv"))
