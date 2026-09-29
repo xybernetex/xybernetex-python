@@ -51,10 +51,13 @@ def planted_reason(target: str) -> str:
 MAX_HELD = 50
 ANY = "*"  # agentId and toolName may be "*"; a tool wildcard needs riskAtLeast
 RISK_THRESHOLDS = tuple(level for level in RISK_LEVELS if level != "none")
-# Labels that may waive a rule. Deliberately just "requested": own_artifact can
-# be staged within a session (create, then delete), so it must never relax
-# enforcement, and unrequested/unassessed obviously can't.
-WAIVING_LABELS = ("requested",)
+# What may waive a rule. "requested": the user's own turn asked for it.
+# "own_files": an own_artifact call that only deletes single files the agent
+# created this session and nothing has moved onto since (authz.owns_files).
+# own_artifact alone never waives: a folder can be staged within a session
+# (mkdir scratch, mv data.csv scratch/, rm -rf scratch). unrequested and
+# unassessed obviously can't.
+WAIVING_LABELS = ("requested", "own_files")
 
 
 def _canonical_json(value: Any) -> str:
@@ -96,6 +99,7 @@ class ToolGate:
     def __init__(self, mode: str = "observe", preset: str | None = None, rules: list[dict] | None = None,
                  log: Callable[[dict], Any] | None = None, authorize: Callable[[dict, dict | None], str | None] | None = None,
                  requests_target: Callable[[dict | None, str], bool] | None = None, max_sessions: int = 200,
+                 owns_files: Callable[[dict, dict | None], bool] | None = None,
                  approvals: bool = True) -> None:
         """approvals=False: nobody can approve a hold (headless agents), so a hold
         is a block that says why from the first call - the plugin's behavior
@@ -111,6 +115,7 @@ class ToolGate:
         self._log = log or (lambda entry: None)
         self._authorize = authorize or (lambda event, ctx: None)
         self._requests_target = requests_target or (lambda ctx, target: False)
+        self._owns_files = owns_files or (lambda event, ctx: False)
         self._max_sessions = max_sessions
         self._sessions: dict[str, _SessionState] = {}
         ids: set[str] = set()
@@ -252,14 +257,22 @@ class ToolGate:
             authorization = self._authorize(event, ctx)
         except Exception:  # noqa: BLE001 - unlabeled: no waiver
             authorization = None
-        matches = [r for r in candidates if authorization not in r["unlessAuthorization"]]
+        own_files = False
+        if authorization == "own_artifact" and any("own_files" in r["unlessAuthorization"] for r in candidates):
+            try:
+                own_files = bool(self._owns_files(event, ctx))
+            except Exception:  # noqa: BLE001 - unproven: no waiver
+                own_files = False
+        matches = [r for r in candidates if authorization not in r["unlessAuthorization"]
+                   and not (own_files and "own_files" in r["unlessAuthorization"])]
         base = {**self._base(event, ctx), "authorization": authorization}
         # A broad approval must never override an overlapping explicit prohibition.
         rule = next((r for r in matches if r["action"] == "block"), matches[0] if matches else None)
         if rule is None:
-            # Every matching rule waived this call because the user asked for it.
+            # Every matching rule waived this call: the user asked for it, or it
+            # only deletes the agent's own files.
             self._safe_log({**base, "type": "tool_gate_waived", "gateId": str(uuid.uuid4()), "riskTier": risk_tier,
-                            "ruleIds": [r["id"] for r in candidates]})
+                            "ruleIds": [r["id"] for r in candidates], **({"waiver": "own_files"} if own_files else {})})
             return None
         enforced = self._mode == "enforce"
         # riskTier is None whenever the rule matched purely on paramsMatch.

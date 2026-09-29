@@ -111,7 +111,9 @@ class Xybernetex:
         self._gate = ToolGate(mode=mode, preset=preset, rules=rules, log=self._write, approvals=approvals,
                               authorize=lambda event, ctx: self._authz.label((ctx or {}).get("session_key"),
                                                                              event.get("tool_name"), event.get("params")),
-                              requests_target=lambda ctx, target: self._authz.requests_target((ctx or {}).get("session_key"), target))
+                              requests_target=lambda ctx, target: self._authz.requests_target((ctx or {}).get("session_key"), target),
+                              owns_files=lambda event, ctx: self._authz.owns_files((ctx or {}).get("session_key"),
+                                                                                   event.get("tool_name"), event.get("params")))
         self._decisions: dict[str, dict] = {}   # tool_call_id -> the gate's decision for that call
         self._input_guardrail = ToolInputGuardrail(guardrail_function=self._on_tool_input, name="xybernetex-gate")
         self._output_guardrail = ToolOutputGuardrail(guardrail_function=self._on_tool_output, name="xybernetex-outcomes")

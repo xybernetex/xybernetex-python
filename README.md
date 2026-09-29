@@ -57,7 +57,9 @@ xyb.flush()                  # before the process exits: closes open episodes, s
 ```
 
 `approvals=False` is for headless agents: a hold becomes a block that tells
-the model why and to ask the user. The log (default
+the model why and to ask the user. The agent may delete files it created itself
+(a plain `rm`/`del`/`Remove-Item` of single files, nothing moved onto them
+since) without either; folders it made stay held, except tool caches. The log (default
 `~/.xybernetex/events.jsonl`) holds the same entries as the OpenClaw
 plugin's: tool names, hashes and labels, never prompts, files or command
 text.
@@ -90,7 +92,7 @@ experiment run replayed through both implementations, identical results):
 | Module | What | Tests | Parity check |
 | --- | --- | --- | --- |
 | `core/risk.py` | what a call does | 11 | 497 shell commands, 1,402 tool calls |
-| `core/authz.py` | who asked; held and planted targets | 27 | 1,402 labels, 1,402 result scans |
+| `core/authz.py` | who asked; held and planted targets; own files | 27 + 11 | 1,402 labels, 1,402 result scans |
 | `core/deaths.py` | deaths behind a reported success | 4 | 198 transcripts |
 | `core/control.py` | the gate: rules, presets, holds, blocks | 33 | 1,402 decisions and log actions |
 | `core/followups.py` | the follow-up prompts and local rule | - | same text as the plugin |

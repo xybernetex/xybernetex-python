@@ -21,15 +21,15 @@ PRESETS: dict[str, list[dict]] = {
     # Hold unrequested destructive calls for a person; everything else runs.
     "recommended": [
         {"id": "preset-destructive-approve", "agentId": "*", "toolName": "*", "riskAtLeast": "destructive",
-         "action": "approve", "approvalDescription": DESTRUCTIVE_APPROVAL, "unlessAuthorization": ["requested"]},
+         "action": "approve", "approvalDescription": DESTRUCTIVE_APPROVAL, "unlessAuthorization": ["requested", "own_files"]},
     ],
     # Refuse unrequested destructive calls outright; hold unrequested
     # outward-facing ones for a person.
     "strict": [
         {"id": "preset-destructive-block", "agentId": "*", "toolName": "*", "riskAtLeast": "destructive",
-         "action": "block", "unlessAuthorization": ["requested"]},
+         "action": "block", "unlessAuthorization": ["requested", "own_files"]},
         {"id": "preset-sensitive-approve", "agentId": "*", "toolName": "*", "riskAtLeast": "sensitive",
-         "action": "approve", "approvalDescription": SENSITIVE_APPROVAL, "unlessAuthorization": ["requested"]},
+         "action": "approve", "approvalDescription": SENSITIVE_APPROVAL, "unlessAuthorization": ["requested", "own_files"]},
     ],
 }
 PRESET_NAMES = tuple(PRESETS)

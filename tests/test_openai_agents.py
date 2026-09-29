@@ -262,6 +262,17 @@ class AdapterTest(unittest.TestCase):
         self.assertNotIsInstance(local.xyb._decide_followup, RemoteDecider)
         self.assertNotIsInstance(local.xyb._outcomes._send, OutcomeSender)
 
+    def test_a_headless_agent_cleans_up_its_own_scratch_file_but_not_a_folder(self):
+        h = Harness([call("run_command", {"command": "echo 'print(1)' > tmp_check.py"}, "c1")],
+                    [call("run_command", {"command": "mkdir scratch"}, "c2")],
+                    [call("run_command", {"command": "rm -f tmp_check.py"}, "c3")],
+                    [call("run_command", {"command": "rm -rf scratch"}, "c4")], [say("Done.")], approvals=False)
+        report = h.run("Build the kv CLI.")
+        self.assertEqual(report.status, "done")
+        self.assertEqual(h.ran, ["echo 'print(1)' > tmp_check.py", "mkdir scratch", "rm -f tmp_check.py"])
+        gate = [(e["type"], e.get("action"), e.get("waiver")) for e in h.logs if e["type"] in ("tool_gate", "tool_gate_waived")]
+        self.assertEqual(gate, [("tool_gate_waived", None, "own_files"), ("tool_gate", "BLOCK_ACTION", None)])
+
     def test_observe_mode_decides_but_starts_nothing(self):
         h = Harness([call("run_command", {"command": "python build.py"}, "c1")], [say("Built.")],
                     followups={"mode": "observe"})

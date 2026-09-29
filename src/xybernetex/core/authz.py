@@ -23,8 +23,24 @@ machine; only the label is ever sent or logged.
 
 "own_artifact" is weaker evidence than "requested" - a same-session
 instruction could create a file and then delete it - so it is a feature for
-the policy, never grounds to skip an enforcement rule. Like risk.py this is
-a heuristic, not a security boundary.
+the policy, never on its own grounds to skip an enforcement rule. Like
+risk.py this is a heuristic, not a security boundary.
+
+`owns_files` is the narrow case that may waive one (a rule lists
+"own_files" in unlessAuthorization): a plain delete (rm, unlink, del,
+Remove-Item) of single files the agent itself created this session -
+written, added by a patch, redirected to with > - that no move has touched
+since, optionally after a cd and followed by read-only commands (ls, cat).
+Deleting such a file loses only the agent's own content: whatever it
+replaced was already gone when the agent wrote it. Paths are resolved
+against the call's workdir and any cd, and must match exactly - a file made
+at tmp/data.csv never covers data.csv. Folders never qualify: `mv data.csv
+scratch/ && rm -rf scratch` would launder a user's file through a folder the
+agent made. The one exception is a tool cache (__pycache__, *.pyc), which
+regenerates itself, and only while no move this session has named a folder
+or file by that name. Any visible move that could land on a tracked file
+(same path, a folder above it, the same file name, or sources we can't read)
+drops it from the set.
 
 A port of the OpenClaw plugin's src/authz.js; tests/test_authz.py holds
 that file's cases, so the two behave identically.
@@ -121,6 +137,49 @@ _GLOB_OR_VAR = re.compile(r"[*?\[\]]|^\$")
 _RELATIVE_PREFIX = re.compile(r"^(\.\.?/|~/)+")
 _EXT = re.compile(r"(\.[a-z0-9]{1,6})$", re.I)
 _SENTENCE_END = re.compile(r"[.!?](?=\s|$)|\n+")
+# owns_files: the only commands, flags and target shapes it accepts.
+_OWN_DELETE_COMMANDS = frozenset({"rm", "unlink", "del", "erase", "remove-item", "ri"})
+_PLAIN_DELETE_FLAG = re.compile(r"^(-f|-v|-fv|-vf|--force|--verbose|-force|/f|/q)$", re.I)
+_RECURSIVE_FLAG = re.compile(r"^(-(?=[rfv]*r)[rfv]+|--recursive|-recurse)$", re.I)
+_PATH_FLAG = re.compile(r"^-(path|literalpath)$", re.I)
+_CD_COMMANDS = frozenset({"cd", "chdir", "pushd", "set-location", "sl"})
+_READ_ONLY_COMMANDS = frozenset({"ls", "dir", "cat", "echo", "pwd", "head", "tail", "wc", "true", "type",
+                                 "get-childitem", "gci", "get-content", "gc"})
+_UNSAFE_TARGET = re.compile(r"[*?\[\]{}$`~,]|(^|[/\\])\.\.([/\\]|$)|^-")
+_ABSOLUTE = re.compile(r"^([/\\]|[a-z]:)", re.I)
+_UNSAFE_SHELL = re.compile(r"[<>|`]|\$\(")
+_UNREADABLE_MOVE = re.compile(r"\bxargs\b|\bfind\b.*-exec|\bparallel\b", re.I)
+
+
+def _resolve(cwd: str, path: str) -> str:
+    """path against a relative working folder, as one normalized relative (or absolute) path."""
+    p = path.replace("\\", "/")
+    if cwd and not _ABSOLUTE.match(p):
+        p = f"{cwd}/{p}"
+    return ("/" if p.startswith("/") else "") + "/".join(x for x in p.split("/") if x not in ("", "."))
+
+
+def _shell_steps(p: dict) -> list[tuple[str | None, str, list[str], str]] | None:
+    """A shell call's commands, each with the folder it runs in: (cwd, cmd, args,
+    segment). cwd is relative to the agent's workspace ("" = the workspace), or
+    None once a cd (or the call's workdir) goes somewhere we can't follow."""
+    text = _shell_text(p)
+    if text is None:
+        return None
+    wd = _first_present(p, "workdir", "cwd")
+    cwd: str | None = ""
+    if isinstance(wd, str) and wd.strip():
+        cwd = _resolve("", wd.strip()) if not _UNSAFE_TARGET.search(wd.strip()) and not _ABSOLUTE.match(wd.strip()) else None
+    steps = []
+    for segment in _split_segments(text):
+        cmd, args = _command(segment)
+        if cmd in _CD_COMMANDS:
+            plain = [a for a in args if not a.startswith("-")]
+            safe = len(plain) == 1 and not _UNSAFE_TARGET.search(plain[0]) and not _ABSOLUTE.match(plain[0])
+            cwd = _resolve(cwd, plain[0]) if cwd is not None and safe else None
+            continue
+        steps.append((cwd, cmd, args, segment))
+    return steps
 
 
 def _split_segments(command: str) -> list[str]:
@@ -485,13 +544,16 @@ def _named_with_verb(text: str, name: str, verbs: list[str]) -> bool:
 
 
 class _Session:
-    __slots__ = ("requests", "request_seen", "paths", "tables")
+    __slots__ = ("requests", "request_seen", "paths", "tables", "files", "moved_names", "moves_unreadable")
 
     def __init__(self) -> None:
         self.requests: list[str] = []
         self.request_seen = False
         self.paths: dict[str, None] = {}  # insertion-ordered sets
         self.tables: dict[str, None] = {}
+        self.files: dict[str, None] = {}  # single files created, no move since (resolved paths)
+        self.moved_names: dict[str, None] = {}  # every path component any move has named
+        self.moves_unreadable = False  # a move named things we couldn't read
 
 
 def _judge(op: dict, session: _Session) -> str:
@@ -510,35 +572,65 @@ def _judge(op: dict, session: _Session) -> str:
     return "unrequested"
 
 
-def _creations(tool_name: str, params: Any) -> tuple[list[str], list[str]]:
+def _creations(tool_name: str, params: Any) -> tuple[list[str], list[str], list[str]]:
     """Things a successful call created, so later deletes of them read as the
-    agent's own scratch work. Deliberately excludes idempotent forms that also
-    succeed on something pre-existing (mkdir -p, touch, CREATE TABLE IF NOT
-    EXISTS, git init), which would let an existing target pass as "created"."""
+    agent's own scratch work: (paths, tables, files), files being the paths
+    that are single files (everything but mkdir). Deliberately excludes
+    idempotent forms that also succeed on something pre-existing (mkdir -p,
+    touch, CREATE TABLE IF NOT EXISTS, git init, >> appends), which would let
+    an existing target pass as "created"."""
     p = _params(params)
     paths: list[str] = []
     tables: list[str] = []
+    files: list[str] = []  # resolved against the call's working folder, for owns_files
     if tool_name in ("write", "write_file"):
         path = _first_present(p, "file_path", "path")
         if isinstance(path, str):
             paths.append(path)
+            files.append(_resolve("", path))
     elif tool_name == "apply_patch":
-        paths.extend(m.strip() for m in _PATCH_ADD.findall(_patch_text(p)))
+        added = [m.strip() for m in _PATCH_ADD.findall(_patch_text(p))]
+        paths.extend(added)
+        files.extend(_resolve("", a) for a in added)
     elif tool_name in SHELL_TOOLS:
-        text = _shell_text(p)
-        if text is None:
-            return paths, tables
-        for segment in _split_segments(text):
-            cmd, args = _command(segment)
+        steps = _shell_steps(p)
+        if steps is None:
+            return paths, tables, files
+        for cwd, cmd, args, segment in steps:
             if cmd in ("mkdir", "md") and not any(_MKDIR_IDEMPOTENT.match(a) for a in args):
                 paths.extend(_plain_args(args, cmd))
             for m in _REDIRECT_CREATE.findall(segment):
                 target = _QUOTE_ENDS.sub("", m)
                 if not _DEVNULL.search(target):
                     paths.append(target)
+                    if cwd is not None and not _UNSAFE_TARGET.search(target):
+                        files.append(_resolve(cwd, target))
             if SQL_CLIENT.search(segment):
                 tables.extend(re.sub(r"[`\"]", "", m) for m in _CREATE_TABLE.findall(segment))
-    return paths, tables
+    return paths, tables, files
+
+
+def _moves(tool_name: str, params: Any) -> tuple[list[str], bool]:
+    """The paths a call's visible moves name (sources and destinations, resolved
+    against its working folder), and whether it moved things we can't name
+    (globs, xargs, find -exec, a folder we lost track of)."""
+    if tool_name not in SHELL_TOOLS:
+        return [], False
+    steps = _shell_steps(_params(params))
+    if steps is None:
+        return [], False
+    named: list[str] = []
+    unreadable = False
+    for cwd, cmd, args, segment in steps:
+        if not (cmd in MOVE_COMMANDS or (cmd == "git" and args[:1] == ["mv"])
+                or (cmd == "rsync" and "--remove-source-files" in args)):
+            continue
+        plain = [a for a in (args[1:] if cmd == "git" else args) if not a.startswith("-")]
+        if (cwd is None or not plain or _UNREADABLE_MOVE.search(segment)
+                or any(_GLOB_OR_VAR.search(a) or _UNSAFE_TARGET.search(a) for a in plain)):
+            unreadable = True
+        named.extend(_resolve(cwd or "", a) for a in plain)
+    return named, unreadable
 
 
 class AuthorizationTracker:
@@ -601,15 +693,81 @@ class AuthorizationTracker:
             return False
         return _named_with_verb("\n".join(s.requests), name, [*VERBS["delete"], "move", "rename", "mv"])
 
+    def owns_files(self, session_key: str | None, tool_name: str, params: Any) -> bool:
+        """Whether this call only deletes single files the agent created this
+        session and no move has touched since, or tool caches no move has
+        named (see the module docstring)."""
+        s = self._sessions.get(session_key) if session_key else None
+        if not s or tool_name not in SHELL_TOOLS:
+            return False
+        p = _params(params)
+        text = _shell_text(p)
+        if text is None or _UNSAFE_SHELL.search(text):
+            return False
+        steps = _shell_steps(p) or []
+        deleted = False
+        for cwd, cmd, args, _segment in steps:
+            if cmd in _READ_ONLY_COMMANDS:
+                continue
+            if cmd not in _OWN_DELETE_COMMANDS or cwd is None:
+                return False
+            targets: list[str] = []
+            recursive = False
+            i = 0
+            while i < len(args):
+                a = args[i]
+                if _PATH_FLAG.match(a) and i + 1 < len(args):
+                    targets.append(args[i + 1])
+                    i += 2
+                    continue
+                if _RECURSIVE_FLAG.match(a):
+                    recursive = True
+                elif a.startswith("-") or (cmd in ("del", "erase") and a.startswith("/")):
+                    if not _PLAIN_DELETE_FLAG.match(a):
+                        return False
+                else:
+                    targets.append(a)
+                i += 1
+            if not targets:
+                return False
+            for t in targets:
+                if _UNSAFE_TARGET.search(t):
+                    return False
+                path = _norm_path(_resolve(cwd, t))
+                name = path.rsplit("/", 1)[-1]
+                cache = REGENERABLE.match(name) and not s.moves_unreadable and name not in s.moved_names
+                if not cache and (recursive or path not in s.files):
+                    return False
+            deleted = True
+        return deleted
+
     def record_completed(self, session_key: str | None, tool_name: str, params: Any, failed: bool = False) -> None:
-        if not session_key or failed:
+        if not session_key:
             return
-        paths, tables = _creations(tool_name, params)
+        # A move - even a failed one, which may have moved part of its sources -
+        # can land something else on a file the agent created, or inside a cache.
+        named, unreadable = _moves(tool_name, params)
+        if named or unreadable:
+            s = self._state(session_key)
+            hit = {_norm_path(n) for n in named}
+            if unreadable:
+                s.files.clear()
+                s.moves_unreadable = True
+            else:
+                names = {h.rsplit("/", 1)[-1] for h in hit}
+                for f in list(s.files):
+                    if f in hit or any(f.startswith(f"{h}/") for h in hit) or f.rsplit("/", 1)[-1] in names:
+                        del s.files[f]
+            self._bounded(s.moved_names, [part for h in hit for part in h.split("/") if part])
+        if failed:
+            return
+        paths, tables, files = _creations(tool_name, params)
         if not paths and not tables:
             return
         s = self._state(session_key)
         self._bounded(s.paths, paths)
         self._bounded(s.tables, tables)
+        self._bounded(s.files, files)
 
     def end_session(self, session_key: str) -> None:
         self._sessions.pop(session_key, None)
