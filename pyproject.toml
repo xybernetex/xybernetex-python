@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xybernetex"
+version = "0.1.0"
+description = "The Xybernetex control plane for Python agent frameworks: safety gate, run outcomes and follow-ups."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Xybernetex", email = "chris@xybernetex.com" }]
+dependencies = []
+
+[project.optional-dependencies]
+openai-agents = ["openai-agents>=0.1"]
+langgraph = ["langgraph>=0.2"]
+
+[project.urls]
+Homepage = "https://xybernetex.com"
+
+[tool.setuptools.packages.find]
+where = ["src"]
