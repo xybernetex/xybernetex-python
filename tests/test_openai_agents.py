@@ -98,6 +98,7 @@ class AdapterTest(unittest.TestCase):
         gate = [e for e in h.logs if e["type"] == "tool_gate"]
         self.assertEqual(gate[0]["action"], "BLOCK_ACTION")
         self.assertEqual(gate[0]["authorization"], "unrequested")
+        self.assertEqual(gate[0]["agentId"], "worker")  # carried from run(); the approval callback isn't given the agent
         self.assertNotIn("rm -rf", json.dumps(h.logs))
 
     def test_a_requested_deletion_runs_without_a_prompt(self):

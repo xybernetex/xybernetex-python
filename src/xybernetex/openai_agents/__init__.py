@@ -51,6 +51,7 @@ from ..core.followups import MESSAGES, RunSummary, decide_local, is_ours
 
 DEFAULT_LOG = Path.home() / ".xybernetex" / "events.jsonl"
 _session_var: contextvars.ContextVar[str] = contextvars.ContextVar("xybernetex_session", default="default")
+_agent_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("xybernetex_agent", default=None)
 
 
 @dataclass
@@ -113,7 +114,9 @@ class Xybernetex:
     # ---- the gate on every tool call ---------------------------------------------------
 
     def _ctx(self, agent_name: str | None, call_id: str | None) -> dict:
-        return {"agent_id": self._agent_id or agent_name, "session_key": _session_var.get(), "tool_call_id": call_id}
+        # The approval callback isn't handed the agent, so run() leaves its name in a context var.
+        return {"agent_id": self._agent_id or agent_name or _agent_var.get(), "session_key": _session_var.get(),
+                "tool_call_id": call_id}
 
     def _decide(self, tool_name: str, args: Any, call_id: str, agent_name: str | None) -> dict:
         """The gate's decision for one call, made once and remembered by call id."""
@@ -211,6 +214,7 @@ class Xybernetex:
                   followup_model: Any = None, **runner_kwargs: Any) -> Report:
         """Runner.run with the gate on, then outcome bookkeeping and the follow-up decision."""
         token = _session_var.set(session_key)
+        agent_token = _agent_var.set(getattr(agent, "name", None))
         try:
             text = self._user_text(run_input)
             if text is not None and not is_ours(text):
@@ -237,14 +241,17 @@ class Xybernetex:
                          "toolCalls": second.summary.tool_calls, "seconds": second.seconds})
             return report
         finally:
+            _agent_var.reset(agent_token)
             _session_var.reset(token)
 
     async def resume(self, agent: Agent, state: Any, *, session_key: str = "default", **runner_kwargs: Any) -> Report:
         """Continue a run that paused for approval, after approve/reject on its RunState."""
         token = _session_var.set(session_key)
+        agent_token = _agent_var.set(getattr(agent, "name", None))
         try:
             return await self._one_turn(self.guard(agent), state, None, runner_kwargs)
         finally:
+            _agent_var.reset(agent_token)
             _session_var.reset(token)
 
     async def _one_turn(self, agent: Agent, run_input: Any, max_turns: int | None, runner_kwargs: dict) -> Report:
