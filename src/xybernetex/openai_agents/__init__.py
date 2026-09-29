@@ -18,11 +18,17 @@ What it does, per run:
   With `approvals=False` (headless agents), a hold is a block that says why.
 - **Run outcomes.** A run that ended with nothing usable is treated as a
   death (core/deaths.py), whatever the SDK reported.
-- **Follow-ups.** After the run, the local rule (core/followups.py) decides
-  whether it gets one more turn - a retry when it died, a check-your-work
-  turn when it finished - in the same conversation, on the run's model or
-  on `followups["model"]`. `mode` "observe" decides and logs but starts
-  nothing; "act" starts the turn.
+- **Follow-ups.** After the run, the policy service (with an API key) or
+  the local rule (core/followups.py) decides whether it gets one more turn -
+  a retry when it died, a check-your-work turn when it finished - in the
+  same conversation, on the run's model or on `followups["model"]`. `mode`
+  "observe" decides and logs but starts nothing; "act" starts the turn.
+- **Outcomes.** Each decision opens an episode (core/outcomes.py) that
+  closes with what the user did next - a correction, the same request again,
+  thanks, something new, or nothing - and is logged and, with an API key,
+  sent to the policy service as labels and counts (turn off with
+  `followups["share_outcomes"] = False`). Call `end_session` when a
+  conversation ends and `flush` before the process exits.
 
 Only the user's own input counts as the user's request: the text passed to
 `run` (or `note_user_message`), never tool output, and never our own
@@ -31,6 +37,7 @@ files or command text.
 """
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import dataclasses
 import json
@@ -48,6 +55,8 @@ from ..core.authz import AuthorizationTracker
 from ..core.control import ToolGate
 from ..core.deaths import retriable
 from ..core.followups import MESSAGES, RunSummary, decide_local, is_ours
+from ..core.outcomes import WRITE_TOOLS, OutcomeTracker
+from ..core.policy import DEFAULT_ENDPOINT, OutcomeSender, RemoteDecider
 
 DEFAULT_LOG = Path.home() / ".xybernetex" / "events.jsonl"
 _session_var: contextvars.ContextVar[str] = contextvars.ContextVar("xybernetex_session", default="default")
@@ -70,13 +79,34 @@ class Report:
 class Xybernetex:
     def __init__(self, *, mode: str = "observe", preset: str | None = "recommended", rules: list[dict] | None = None,
                  log: Callable[[dict], Any] | str | os.PathLike | None = None, approvals: bool = True,
-                 followups: dict | None = None, agent_id: str | None = None) -> None:
+                 followups: dict | None = None, agent_id: str | None = None, api_key: str | None = None,
+                 endpoint: str | None = None) -> None:
+        """followups: {"mode": "off"|"observe"|"act", "model": a Model for the follow-up turn,
+        "policy": "remote"|"local" (remote when there's an API key), "share_outcomes": bool
+        (default True with an API key), "quiet_minutes": how long a user's silence takes to
+        close an episode (30), "decide"/"send": your own decision and outcome functions}.
+        api_key defaults to $XYBERNETEX_API_KEY, endpoint to $XYBERNETEX_ENDPOINT or
+        https://api.xybernetex.com."""
         self._log_target = log
         self._approvals = approvals
         self._followups = dict(followups or {})
         if self._followups.get("mode", "observe") not in ("off", "observe", "act"):
             raise ValueError("followups.mode must be off, observe or act")
+        if self._followups.get("policy", "remote") not in ("remote", "local"):
+            raise ValueError("followups.policy must be remote or local")
+        quiet = self._followups.get("quiet_minutes", 30)
+        if not isinstance(quiet, (int, float)) or not 1 <= quiet <= 1440:
+            raise ValueError("followups.quiet_minutes must be 1-1440")
         self._agent_id = agent_id
+        key = api_key or os.environ.get("XYBERNETEX_API_KEY") or None
+        endpoint = endpoint or os.environ.get("XYBERNETEX_ENDPOINT") or DEFAULT_ENDPOINT
+        self._followup_mode = self._followups.get("mode", "observe") if followups else "off"
+        remote = bool(key) and self._followups.get("policy", "remote") == "remote"
+        self._decide_followup = self._followups.get("decide") or (RemoteDecider(key, endpoint) if remote else decide_local)
+        send = self._followups.get("send") or (
+            OutcomeSender(key, endpoint) if key and self._followups.get("share_outcomes", True) else None)
+        self._outcomes = (OutcomeTracker(log=self._write, send=send, quiet_s=quiet * 60)
+                          if self._followup_mode != "off" else None)
         self._authz = AuthorizationTracker()
         self._gate = ToolGate(mode=mode, preset=preset, rules=rules, log=self._write, approvals=approvals,
                               authorize=lambda event, ctx: self._authz.label((ctx or {}).get("session_key"),
@@ -87,7 +117,9 @@ class Xybernetex:
         self._output_guardrail = ToolOutputGuardrail(guardrail_function=self._on_tool_output, name="xybernetex-outcomes")
         self.rule_ids = self._gate.rule_ids
         self._write({"type": "tool_gate_ready", "mode": mode, "preset": preset or "none", "ruleIds": self.rule_ids,
-                     "approvals": approvals, "followups": self._followups.get("mode", "observe") if followups else "off"})
+                     "approvals": approvals, "followups": self._followup_mode,
+                     **({"policy": "custom" if self._followups.get("decide") else "remote" if remote else "local",
+                         "shareOutcomes": send is not None} if self._outcomes else {})})
 
     # ---- logging -------------------------------------------------------------------------
 
@@ -110,6 +142,19 @@ class Xybernetex:
         """Record a user turn for hooks-only use (run() does this itself)."""
         if not is_ours(text):
             self._authz.set_request(session_key, text, None)
+            if self._outcomes:
+                self._outcomes.note_user_turn(session_key, text)
+
+    def end_session(self, session_key: str) -> None:
+        """The conversation is over: close its episode and forget its requests."""
+        self._authz.end_session(session_key)
+        if self._outcomes:
+            self._outcomes.end_session(session_key)
+
+    def flush(self, timeout: float = 5.0) -> None:
+        """Close every open episode and wait (up to `timeout` each) for outcome sends. Call before exit."""
+        if self._outcomes:
+            self._outcomes.flush(timeout)
 
     # ---- the gate on every tool call ---------------------------------------------------
 
@@ -217,28 +262,45 @@ class Xybernetex:
         agent_token = _agent_var.set(getattr(agent, "name", None))
         try:
             text = self._user_text(run_input)
-            if text is not None and not is_ours(text):
-                self._authz.set_request(session_key, text, None)
+            if text is not None:
+                self.note_user_message(session_key, text)
             guarded = self.guard(agent)
             report = await self._one_turn(guarded, run_input, max_turns, runner_kwargs)
-            self._write({"type": "run_end", "sessionKey": session_key, "agentId": self._agent_id or agent.name,
+            report.summary.model = _model_label(agent.model)
+            agent_id = self._agent_id or agent.name
+            self._write({"type": "run_end", "sessionKey": session_key, "agentId": agent_id,
                          "success": report.summary.success, "error": report.error, "toolCalls": report.summary.tool_calls,
                          "seconds": report.seconds, "held": report.status == "held"})
-            mode = self._followups.get("mode", "observe") if self._followups else "off"
+            mode = self._followup_mode
             if mode == "off" or report.status == "held":
                 return report
-            report.decision = decide_local(report.summary)
-            self._write({"type": "intervention", "sessionKey": session_key, "mode": mode, **report.decision})
-            if mode != "act" or report.decision["action"] == "none" or report.result is None:
-                return report
-            model = followup_model or self._followups.get("model")
-            follow_agent = guarded.clone(model=model) if model else guarded
-            history = report.result.to_input_list() + [{"role": "user", "content": MESSAGES[report.decision["action"]]}]
-            second = await self._one_turn(follow_agent, history, max_turns, runner_kwargs)
-            report.followup = second.result
-            self._write({"type": "followup_end", "sessionKey": session_key, "action": report.decision["action"],
-                         "model": str(model) if model else None, "success": second.summary.success,
-                         "toolCalls": second.summary.tool_calls, "seconds": second.seconds})
+            try:
+                report.decision = await asyncio.to_thread(self._decide_followup, report.summary)
+            except Exception as err:  # noqa: BLE001 - a custom decide() failing means no follow-up
+                report.decision = {"action": "none", "probability": 1, "rule": f"decide-failed: {str(err)[:80]}"}
+            report.decision.setdefault("policy", None)
+            self._write({"type": "intervention", "sessionKey": session_key, "agentId": agent_id, "mode": mode,
+                         "model": report.summary.model, **report.decision})
+            second = None
+            action = report.decision["action"]
+            if mode == "act" and action in MESSAGES and report.result is not None:
+                model = followup_model or self._followups.get("model")
+                follow_agent = guarded.clone(model=model) if model else guarded
+                history = report.result.to_input_list() + [{"role": "user", "content": MESSAGES[action]}]
+                second = await self._one_turn(follow_agent, history, max_turns, runner_kwargs)
+                report.followup = second.result
+                self._write({"type": "followup_end", "sessionKey": session_key, "action": action,
+                             "model": _model_label(model) if model else report.summary.model,
+                             "success": second.summary.success, "toolCalls": second.summary.tool_calls,
+                             "seconds": second.seconds})
+            if self._outcomes:
+                self._outcomes.open(
+                    session_key, agent_id=agent_id, model=report.summary.model, mode=mode, decision=report.decision,
+                    applied=action if second is not None else "none",
+                    run={"success": report.summary.success, "retriable": report.summary.retriable,
+                         "toolCalls": report.summary.tool_calls, "tokens": _tokens(report.result)},
+                    followup=None if second is None else {
+                        "success": second.status == "done", **self._work(second.result), "tokens": _tokens(second.result)})
             return report
         finally:
             _agent_var.reset(agent_token)
@@ -253,6 +315,13 @@ class Xybernetex:
         finally:
             _agent_var.reset(agent_token)
             _session_var.reset(token)
+
+    def _work(self, result: Any) -> dict:
+        """A run's tool calls, file writes and calls the gate refused, for its outcome."""
+        calls = [self._call_of(i) for i in (result.new_items if result is not None else []) if isinstance(i, ToolCallItem)]
+        refused = [cid for _, cid, _ in calls if (self._decisions.get(cid) or {}).get("block")]
+        writes = sum(1 for name, cid, _ in calls if WRITE_TOOLS.match(name or "") and cid not in refused)
+        return {"toolCalls": len(calls), "writes": writes, "failedCalls": len(refused)}
 
     @staticmethod
     def _call_of(item: Any) -> tuple[str | None, str | None, Any]:
@@ -325,3 +394,21 @@ class Xybernetex:
             return Report(result=result, status="died", error=error, seconds=seconds,
                           summary=RunSummary(success=False, tool_calls=tool_calls, retriable=True, error=error))
         return Report(result=result, status="done", seconds=seconds, summary=RunSummary(success=True, tool_calls=tool_calls))
+
+
+def _model_label(model: Any) -> str | None:
+    """The model's id: the string itself, or a Model object's model name."""
+    if isinstance(model, str):
+        return model or None
+    for attr in ("model", "model_name", "name"):
+        value = getattr(model, attr, None)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _tokens(result: Any) -> int | None:
+    try:
+        return int(result.context_wrapper.usage.total_tokens)
+    except Exception:  # noqa: BLE001 - no result, or no usage reported
+        return None

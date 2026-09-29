@@ -28,7 +28,7 @@ The same three things as the OpenClaw plugin:
 ```
 src/xybernetex/
   core/          framework-independent: risk classification, who-asked labels,
-                 held targets, death detection, the policy client
+                 held targets, death detection, follow-ups, outcomes, the policy client
   openai_agents/ the adapter for the OpenAI Agents SDK (hooks + tool wrappers)
   langgraph/     the adapter for LangGraph (later)
 tests/           unittest; the JavaScript plugin's tests are the reference
@@ -51,10 +51,27 @@ if report.status == "held":                     # a destructive call nobody aske
     state = report.result.to_state()
     state.approve(report.interruptions[0])      # or state.reject(..., rejection_message=...)
     report = await xyb.resume(agent, state, session_key="chat-42")
+
+xyb.end_session("chat-42")   # when the conversation is over
+xyb.flush()                  # before the process exits: closes open episodes, sends them
 ```
 
 `approvals=False` is for headless agents: a hold becomes a block that tells
-the model why and to ask the user.
+the model why and to ask the user. The log (default
+`~/.xybernetex/events.jsonl`) holds the same entries as the OpenClaw
+plugin's: tool names, hashes and labels, never prompts, files or command
+text.
+
+**The policy service.** With an API key (`api_key=` or
+`XYBERNETEX_API_KEY`), follow-up decisions come from api.xybernetex.com
+(`POST /intervene`, told only success, retriable, tool-call count and model
+id) and fall back to the local rule if it can't answer. Each decision opens an
+episode that closes with what the user did next - a correction, the same
+request again, thanks, something new, or silence (`quiet_minutes`, 30) - and
+is sent as labels and counts (`POST /outcome`); the user's words are
+classified in memory and never logged or sent. `followups={"policy":
+"local"}` keeps decisions local; `"share_outcomes": False` keeps episodes in
+the local log. Without a key, everything stays local.
 
 One SDK behaviour the adapter covers for you: when a tool has a callable
 `needs_approval`, the SDK consults it only if the model's arguments round-trip
@@ -63,9 +80,7 @@ left out makes the SDK pause for approval on its own, without asking any
 policy. The adapter decides those pauses the way the gate would have (allowed
 calls resume by themselves, blocks are rejected with the reason, real holds
 stay for a person), so tools with optional parameters work the same as any
-other. The log (default `~/.xybernetex/events.jsonl`)
-holds the same entries as the OpenClaw plugin's: tool names, hashes and
-labels, never prompts, files or command text.
+other.
 
 ## Status
 
@@ -79,10 +94,15 @@ experiment run replayed through both implementations, identical results):
 | `core/deaths.py` | deaths behind a reported success | 4 | 198 transcripts |
 | `core/control.py` | the gate: rules, presets, holds, blocks | 33 | 1,402 decisions and log actions |
 | `core/followups.py` | the follow-up prompts and local rule | - | same text as the plugin |
-| `openai_agents/` | the adapter | 8 end-to-end | scripted model through real `Runner.run` |
+| `core/policy.py` | the policy-service client (`/intervene`, `/outcome`) | 6 | wire format = the plugin's; summaries pass the service's validator |
+| `core/outcomes.py` | episodes: what happened after a decision | 8 | the plugin's classifier cases; episodes pass the service's validator |
+| `openai_agents/` | the adapter | 10 end-to-end | scripted model through real `Runner.run` |
 
-Not yet: the policy-service client (remote decisions and outcome signals),
-the report, and the LangGraph adapter. Known gap: the SDK drops the model's
+One deliberate difference from the plugin: an episode in act mode where the
+rule held the follow-up out ("none", probability 0.1) records 0.1, the
+chance it was actually left untreated; the plugin 0.4.1 records 1 there.
+
+Not yet: the report and the LangGraph adapter. Known gap: the SDK drops the model's
 finish reason, so a cut-off answer looks like a short answer; only an empty
 answer is recognized as a death.
 

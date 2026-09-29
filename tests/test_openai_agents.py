@@ -17,6 +17,10 @@ from xybernetex.core.followups import MARKER
 from xybernetex.openai_agents import Xybernetex
 
 set_tracing_disabled(True)
+# Never reach the real policy service from a test run, whatever the shell has set.
+import os  # noqa: E402
+os.environ.pop("XYBERNETEX_API_KEY", None)
+os.environ.pop("XYBERNETEX_ENDPOINT", None)
 # The local follow-up rule holds out 10% of runs at random (the same rule as the plugin's); the
 # tests want the acting branch every time.
 import functools  # noqa: E402
@@ -209,6 +213,54 @@ class AdapterTest(unittest.TestCase):
         resumed = asyncio.run(h.xyb.resume(h.agent, state, session_key="s"))
         self.assertEqual(resumed.status, "done")
         self.assertEqual(h.ran, ["rm -rf data"])
+
+    def test_an_episode_records_the_followup_and_closes_on_the_users_next_message(self):
+        sent = []
+        checker = ScriptedModel([call("run_command", {"command": "pytest -q"}, "v1")], [say("All checks pass.")], name="checker")
+        decide = lambda s: {"action": "verify" if s.tool_calls else "none", "probability": 0.5,  # noqa: E731
+                            "rule": "test", "policy": "test-policy"}
+        h = Harness([call("run_command", {"command": "python build.py"}, "c1")], [say("Built.")], [say("Fixing it.")],
+                    followups={"mode": "act", "model": checker, "decide": decide, "send": sent.append})
+        report = h.run("Build the project and summarize the totals per region.")
+        self.assertEqual(report.decision["action"], "verify")
+        self.assertEqual(report.followup.final_output, "All checks pass.")
+        h.run("that didn't work, the totals are off")  # the user's correction closes the first episode
+        h.xyb.flush()
+        first = sent[0]
+        self.assertEqual((first["action"], first["applied"], first["probability"], first["policy"]), ("verify", "verify", 0.5, "test-policy"))
+        self.assertEqual(first["model"], "scripted")
+        self.assertEqual(first["run"], {"success": True, "retriable": False, "toolCalls": 1, "tokens": 0})
+        self.assertEqual(first["followup"], {"success": True, "toolCalls": 1, "writes": 0, "failedCalls": 0, "tokens": 0})
+        self.assertEqual((first["verify"], first["user"]), ("confirmed", "correction"))
+        self.assertIsInstance(first["gapSec"], int)
+        # The second run did no work, so nothing was applied; flush closed it.
+        self.assertEqual((sent[1]["action"], sent[1]["applied"], sent[1]["user"]), ("none", "none", "session_end"))
+        wire = json.dumps(sent)
+        self.assertNotIn("totals", wire)  # the user's words never leave, only labels
+        self.assertNotIn("build.py", wire)
+        self.assertEqual([e["user"] for e in h.logs if e["type"] == "episode"], ["correction", "session_end"])
+
+    def test_an_api_key_switches_decisions_and_outcomes_to_the_policy_service(self):
+        from xybernetex.core.policy import OutcomeSender, RemoteDecider
+        h = Harness([call("run_command", {"command": "python build.py"}, "c1")], [say("Built.")],
+                    followups={"mode": "observe"}, api_key="k")
+        self.assertIsInstance(h.xyb._decide_followup, RemoteDecider)
+        ready = [e for e in h.logs if e["type"] == "tool_gate_ready"][0]
+        self.assertEqual((ready["policy"], ready["shareOutcomes"]), ("remote", True))
+        wire = []
+        h.xyb._decide_followup._post = lambda url, key, body, timeout: (
+            wire.append((url, body)) or (200, {"action": "verify", "probability": 0.9, "rule": "verify", "policy": "v1"}))
+        h.xyb._outcomes._send = lambda episode: None  # don't post the episode anywhere
+        report = h.run("Build the project.")
+        self.assertEqual(report.decision, {"action": "verify", "probability": 0.9, "rule": "verify", "policy": "v1"})
+        self.assertEqual(wire, [("https://api.xybernetex.com/intervene",
+                                 {"summary": {"success": True, "retriable": False, "toolCalls": 1, "model": "scripted"}})])
+        self.assertIsNone(report.followup)  # observe mode
+        local = Harness(followups={"mode": "observe", "policy": "local", "share_outcomes": False}, api_key="k")
+        ready = [e for e in local.logs if e["type"] == "tool_gate_ready"][0]
+        self.assertEqual((ready["policy"], ready["shareOutcomes"]), ("local", False))
+        self.assertNotIsInstance(local.xyb._decide_followup, RemoteDecider)
+        self.assertNotIsInstance(local.xyb._outcomes._send, OutcomeSender)
 
     def test_observe_mode_decides_but_starts_nothing(self):
         h = Harness([call("run_command", {"command": "python build.py"}, "c1")], [say("Built.")],
