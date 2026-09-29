@@ -189,6 +189,22 @@ class ControlTest(unittest.TestCase):
         self.assertEqual(logs[-1]["action"], "BLOCK_ACTION")
         self.assertIn("require_approval", gate(exec_("rm -rf /tmp/other-data"), {**DEMO, "session_key": "other"}))
 
+    def test_without_approvals_a_hold_is_a_block_that_says_why_from_the_first_call(self):
+        logs = []
+        gate = preset(logs, approvals=False)
+        first = gate(exec_("rm -rf ../customer-data"), DEMO)
+        self.assertTrue(first["block"])
+        self.assertIn("user didn't ask for this", first["block_reason"])
+        self.assertEqual(logs[-1]["action"], "BLOCK_ACTION")
+        self.assertTrue(logs[-1]["approvalUnavailable"])
+        self.assertNotIn("require_approval", first)
+        # Requested calls still run; operator approval rules without who-asked keep their own wording.
+        asked = ToolGate(mode="enforce", preset="recommended", authorize=labelled("requested"), approvals=False)
+        self.assertIsNone(asked(exec_("rm -rf build"), DEMO))
+        plain = ToolGate(mode="enforce", rules=[APPROVAL_RULE], approvals=False)(WRITE, WRITE_CTX)
+        self.assertTrue(plain["block"])
+        self.assertIn("no one can approve it in this session", plain["block_reason"])
+
     def test_after_a_hold_moving_renaming_or_overwriting_the_target_is_held_too(self):
         logs = []
         gate = preset(logs)

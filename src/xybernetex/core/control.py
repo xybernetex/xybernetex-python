@@ -95,9 +95,14 @@ class _SessionState:
 class ToolGate:
     def __init__(self, mode: str = "observe", preset: str | None = None, rules: list[dict] | None = None,
                  log: Callable[[dict], Any] | None = None, authorize: Callable[[dict, dict | None], str | None] | None = None,
-                 requests_target: Callable[[dict | None, str], bool] | None = None, max_sessions: int = 200) -> None:
+                 requests_target: Callable[[dict | None, str], bool] | None = None, max_sessions: int = 200,
+                 approvals: bool = True) -> None:
+        """approvals=False: nobody can approve a hold (headless agents), so a hold
+        is a block that says why from the first call - the plugin's behavior
+        once OpenClaw reports an approval "cancelled"."""
         if mode not in ("observe", "enforce"):
             raise ValueError("control.mode must be observe or enforce")
+        self._approvals = approvals
         if rules is None:
             rules = []
         if not isinstance(rules, list):
@@ -274,8 +279,8 @@ class ToolGate:
             except Exception:  # noqa: BLE001 - the call itself is still gated below
                 pass
         # With no one to approve it, a hold is a block - one that says why.
-        no_approvals = rule["action"] == "approve" and bool(state_key) and bool(
-            (self._session(state_key, False) or _SessionState()).no_approvals)
+        no_approvals = rule["action"] == "approve" and (not self._approvals or (bool(state_key) and bool(
+            (self._session(state_key, False) or _SessionState()).no_approvals)))
         action = "REQUEST_USER" if rule["action"] == "approve" and not no_approvals else "BLOCK_ACTION"
         self._safe_log({**metadata, "type": "tool_gate", **({"approvalUnavailable": True} if no_approvals else {}),
                         "action": action if enforced else "WOULD_REQUEST_USER" if rule["action"] == "approve" else "WOULD_BLOCK"})
