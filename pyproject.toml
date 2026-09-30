@@ -14,7 +14,7 @@ dependencies = []
 
 [project.optional-dependencies]
 openai-agents = ["openai-agents>=0.1"]
-langgraph = ["langgraph>=0.2"]
+langgraph = ["langgraph>=1.0"]
 
 [project.urls]
 Homepage = "https://xybernetex.com"

@@ -98,15 +98,40 @@ experiment run replayed through both implementations, identical results):
 | `core/followups.py` | the follow-up prompts and local rule | - | same text as the plugin |
 | `core/policy.py` | the policy-service client (`/intervene`, `/outcome`) | 6 | wire format = the plugin's; summaries pass the service's validator |
 | `core/outcomes.py` | episodes: what happened after a decision | 8 | the plugin's classifier cases; episodes pass the service's validator |
-| `openai_agents/` | the adapter | 10 end-to-end | scripted model through real `Runner.run` |
+| `openai_agents/` | the OpenAI Agents SDK adapter | 13 end-to-end | scripted model through real `Runner.run` |
+| `langgraph/` | the LangGraph adapter | 11 end-to-end | scripted chat model through a real ReAct graph, interrupts and resumes |
 
 One deliberate difference from the plugin: an episode in act mode where the
 rule held the follow-up out ("none", probability 0.1) records 0.1, the
 chance it was actually left untreated; the plugin 0.4.1 records 1 there.
 
-Not yet: the report and the LangGraph adapter. Known gap: the SDK drops the model's
+Not yet: the report, and LangChain 1.0's `create_agent` middleware. Known gap: the SDK drops the model's
 finish reason, so a cut-off answer looks like a short answer; only an empty
 answer is recognized as a death.
+
+## Usage (LangGraph)
+
+```python
+from xybernetex.langgraph import Xybernetex
+
+xyb = Xybernetex(mode="enforce", preset="recommended", followups={"mode": "act"})
+graph = create_react_agent(model, tools=xyb.tool_node(tools), checkpointer=InMemorySaver())
+config = {"configurable": {"thread_id": "chat-42"}}
+report = await xyb.run(graph, "Delete the build folder", config=config,
+                       followup_graph=stronger_graph)   # optional: follow-ups on another model
+if report.status == "held":                             # LangGraph interrupt(), with our title and reason
+    report = await xyb.resume(graph, "allow-once", config=config)   # or "deny"
+```
+
+The gate is a `ToolNode` interceptor (`wrap_tool_call`), so it covers the
+prebuilt ReAct agent and custom graphs alike: use `xyb.tool_node(tools)`,
+or pass `xyb.wrap_tool_call` / `xyb.awrap_tool_call` to your own `ToolNode`.
+A graph invoked directly, without `xyb.run`, is still gated; the user's
+request is then read from the latest human message in the graph's state.
+LangChain keeps each reply's finish reason, so here a reply cut off at the
+output limit is recognized as a death, not just an empty one. Not covered
+yet: LangChain 1.0's `create_agent` (it takes middleware instead of a
+`ToolNode`).
 
 ## Development
 

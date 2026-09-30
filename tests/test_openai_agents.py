@@ -24,7 +24,7 @@ os.environ.pop("XYBERNETEX_ENDPOINT", None)
 # The local follow-up rule holds out 10% of runs at random (the same rule as the plugin's); the
 # tests want the acting branch every time.
 import functools  # noqa: E402
-import xybernetex.openai_agents as _oa  # noqa: E402
+import xybernetex._adapter as _oa  # noqa: E402
 _oa.decide_local = functools.partial(_oa.decide_local, random=lambda: 0.0)
 
 

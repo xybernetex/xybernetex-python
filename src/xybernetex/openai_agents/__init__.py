@@ -37,126 +37,33 @@ files or command text.
 """
 from __future__ import annotations
 
-import asyncio
 import contextvars
 import dataclasses
 import json
-import os
 import time
-from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable
 
 from agents import Agent, FunctionTool, Runner, ToolGuardrailFunctionOutput, ToolInputGuardrail, ToolOutputGuardrail
-from agents.exceptions import AgentsException, MaxTurnsExceeded
+from agents.exceptions import MaxTurnsExceeded
 from agents.items import ToolCallItem
 
-from ..core.authz import AuthorizationTracker
-from ..core.control import ToolGate
+from .._adapter import AdapterBase, Report, model_label
 from ..core.deaths import retriable
-from ..core.followups import MESSAGES, RunSummary, decide_local, is_ours
-from ..core.outcomes import WRITE_TOOLS, OutcomeTracker
-from ..core.policy import DEFAULT_ENDPOINT, OutcomeSender, RemoteDecider
+from ..core.followups import MESSAGES, RunSummary
 
-DEFAULT_LOG = Path.home() / ".xybernetex" / "events.jsonl"
+__all__ = ["Xybernetex", "Report"]
+
 _session_var: contextvars.ContextVar[str] = contextvars.ContextVar("xybernetex_session", default="default")
 _agent_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("xybernetex_agent", default=None)
 
 
-@dataclass
-class Report:
-    """What `run` returns: the SDK's result plus what Xybernetex did with it."""
-    result: Any = None                      # RunResult, or None when the run raised
-    status: str = "done"                    # done | died | held | failed
-    error: str | None = None
-    summary: RunSummary | None = None
-    decision: dict | None = None            # the follow-up decision, if follow-ups are configured
-    followup: Any = None                    # the follow-up turn's RunResult, if one ran
-    seconds: float = 0.0
-    interruptions: list = field(default_factory=list)
+class Xybernetex(AdapterBase):
 
 
-class Xybernetex:
-    def __init__(self, *, mode: str = "observe", preset: str | None = "recommended", rules: list[dict] | None = None,
-                 log: Callable[[dict], Any] | str | os.PathLike | None = None, approvals: bool = True,
-                 followups: dict | None = None, agent_id: str | None = None, api_key: str | None = None,
-                 endpoint: str | None = None) -> None:
-        """followups: {"mode": "off"|"observe"|"act", "model": a Model for the follow-up turn,
-        "policy": "remote"|"local" (remote when there's an API key), "share_outcomes": bool
-        (default True with an API key), "quiet_minutes": how long a user's silence takes to
-        close an episode (30), "decide"/"send": your own decision and outcome functions}.
-        api_key defaults to $XYBERNETEX_API_KEY, endpoint to $XYBERNETEX_ENDPOINT or
-        https://api.xybernetex.com."""
-        self._log_target = log
-        self._approvals = approvals
-        self._followups = dict(followups or {})
-        if self._followups.get("mode", "observe") not in ("off", "observe", "act"):
-            raise ValueError("followups.mode must be off, observe or act")
-        if self._followups.get("policy", "remote") not in ("remote", "local"):
-            raise ValueError("followups.policy must be remote or local")
-        quiet = self._followups.get("quiet_minutes", 30)
-        if not isinstance(quiet, (int, float)) or not 1 <= quiet <= 1440:
-            raise ValueError("followups.quiet_minutes must be 1-1440")
-        self._agent_id = agent_id
-        key = api_key or os.environ.get("XYBERNETEX_API_KEY") or None
-        endpoint = endpoint or os.environ.get("XYBERNETEX_ENDPOINT") or DEFAULT_ENDPOINT
-        self._followup_mode = self._followups.get("mode", "observe") if followups else "off"
-        remote = bool(key) and self._followups.get("policy", "remote") == "remote"
-        self._decide_followup = self._followups.get("decide") or (RemoteDecider(key, endpoint) if remote else decide_local)
-        send = self._followups.get("send") or (
-            OutcomeSender(key, endpoint) if key and self._followups.get("share_outcomes", True) else None)
-        self._outcomes = (OutcomeTracker(log=self._write, send=send, quiet_s=quiet * 60)
-                          if self._followup_mode != "off" else None)
-        self._authz = AuthorizationTracker()
-        self._gate = ToolGate(mode=mode, preset=preset, rules=rules, log=self._write, approvals=approvals,
-                              authorize=lambda event, ctx: self._authz.label((ctx or {}).get("session_key"),
-                                                                             event.get("tool_name"), event.get("params")),
-                              requests_target=lambda ctx, target: self._authz.requests_target((ctx or {}).get("session_key"), target),
-                              owns_files=lambda event, ctx: self._authz.owns_files((ctx or {}).get("session_key"),
-                                                                                   event.get("tool_name"), event.get("params")))
-        self._decisions: dict[str, dict] = {}   # tool_call_id -> the gate's decision for that call
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
         self._input_guardrail = ToolInputGuardrail(guardrail_function=self._on_tool_input, name="xybernetex-gate")
         self._output_guardrail = ToolOutputGuardrail(guardrail_function=self._on_tool_output, name="xybernetex-outcomes")
-        self.rule_ids = self._gate.rule_ids
-        self._write({"type": "tool_gate_ready", "mode": mode, "preset": preset or "none", "ruleIds": self.rule_ids,
-                     "approvals": approvals, "followups": self._followup_mode,
-                     **({"policy": "custom" if self._followups.get("decide") else "remote" if remote else "local",
-                         "shareOutcomes": send is not None} if self._outcomes else {})})
-
-    # ---- logging -------------------------------------------------------------------------
-
-    def _write(self, entry: dict) -> None:
-        record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z", **entry}
-        try:
-            if callable(self._log_target):
-                self._log_target(record)
-                return
-            path = Path(self._log_target) if self._log_target else DEFAULT_LOG
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record) + "\n")
-        except Exception:  # noqa: BLE001 - logging must never break the agent
-            pass
-
-    # ---- the user's own words ----------------------------------------------------------
-
-    def note_user_message(self, session_key: str, text: str) -> None:
-        """Record a user turn for hooks-only use (run() does this itself)."""
-        if not is_ours(text):
-            self._authz.set_request(session_key, text, None)
-            if self._outcomes:
-                self._outcomes.note_user_turn(session_key, text)
-
-    def end_session(self, session_key: str) -> None:
-        """The conversation is over: close its episode and forget its requests."""
-        self._authz.end_session(session_key)
-        if self._outcomes:
-            self._outcomes.end_session(session_key)
-
-    def flush(self, timeout: float = 5.0) -> None:
-        """Close every open episode and wait (up to `timeout` each) for outcome sends. Call before exit."""
-        if self._outcomes:
-            self._outcomes.flush(timeout)
 
     # ---- the gate on every tool call ---------------------------------------------------
 
@@ -166,19 +73,7 @@ class Xybernetex:
                 "tool_call_id": call_id}
 
     def _decide(self, tool_name: str, args: Any, call_id: str, agent_name: str | None) -> dict:
-        """The gate's decision for one call, made once and remembered by call id."""
-        cached = self._decisions.get(call_id)
-        if cached is not None:
-            return cached
-        params = args if isinstance(args, dict) else {}
-        decision = self._gate({"tool_name": tool_name, "params": params, "tool_call_id": call_id},
-                              self._ctx(agent_name, call_id)) or {}
-        decision["_tool"] = tool_name
-        decision["_params"] = params
-        self._decisions[call_id] = decision
-        while len(self._decisions) > 1000:
-            del self._decisions[next(iter(self._decisions))]
-        return decision
+        return self._gate_decision(tool_name, args, call_id, self._ctx(agent_name, call_id))
 
     def _needs_approval_for(self, tool: FunctionTool) -> Callable:
         async def needs_approval(ctx: Any, args: dict, call_id: str) -> bool:
@@ -205,23 +100,8 @@ class Xybernetex:
 
     def _on_tool_output(self, data: Any) -> ToolGuardrailFunctionOutput:
         tc = data.context
-        args = self._parse_args(tc)
-        decision = self._decisions.get(tc.tool_call_id) or {}
-        hold = decision.get("require_approval")
-        if hold and not decision.get("_resolved"):
-            # The tool ran, so a person approved it.
-            decision["_resolved"] = True
-            try:
-                hold["on_resolution"]("allow-once")
-            except Exception:  # noqa: BLE001
-                pass
-        ctx = self._ctx(getattr(data.agent, "name", None), tc.tool_call_id)
-        try:
-            self._authz.record_completed(ctx["session_key"], tc.tool_name, args, False)
-            self._gate.note_tool_result({"tool_name": tc.tool_name, "params": args, "tool_call_id": tc.tool_call_id,
-                                         "result": data.output}, ctx)
-        except Exception:  # noqa: BLE001 - bookkeeping must never fail a tool
-            pass
+        self._tool_done(tc.tool_name, self._parse_args(tc), tc.tool_call_id, data.output,
+                        self._ctx(getattr(data.agent, "name", None), tc.tool_call_id))
         return ToolGuardrailFunctionOutput.allow()
 
     def protect(self, tools: list) -> list:
@@ -268,24 +148,15 @@ class Xybernetex:
                 self.note_user_message(session_key, text)
             guarded = self.guard(agent)
             report = await self._one_turn(guarded, run_input, max_turns, runner_kwargs)
-            report.summary.model = _model_label(agent.model)
+            report.summary.model = model_label(agent.model)
             agent_id = self._agent_id or agent.name
-            self._write({"type": "run_end", "sessionKey": session_key, "agentId": agent_id,
-                         "success": report.summary.success, "error": report.error, "toolCalls": report.summary.tool_calls,
-                         "seconds": report.seconds, "held": report.status == "held"})
-            mode = self._followup_mode
-            if mode == "off" or report.status == "held":
+            self._run_end(session_key, agent_id, report)
+            report.decision = await self._decide_after(session_key, agent_id, report)
+            if report.decision is None:
                 return report
-            try:
-                report.decision = await asyncio.to_thread(self._decide_followup, report.summary)
-            except Exception as err:  # noqa: BLE001 - a custom decide() failing means no follow-up
-                report.decision = {"action": "none", "probability": 1, "rule": f"decide-failed: {str(err)[:80]}"}
-            report.decision.setdefault("policy", None)
-            self._write({"type": "intervention", "sessionKey": session_key, "agentId": agent_id, "mode": mode,
-                         "model": report.summary.model, **report.decision})
             second = None
             action = report.decision["action"]
-            if mode == "act" and action in MESSAGES and (report.result is not None or action == "retry"):
+            if self._followup_mode == "act" and action in MESSAGES and (report.result is not None or action == "retry"):
                 model = followup_model or self._followups.get("model")
                 follow_agent = guarded.clone(model=model) if model else guarded
                 # A run that raised has no transcript: the retry starts from the
@@ -295,18 +166,10 @@ class Xybernetex:
                 history = before + [{"role": "user", "content": MESSAGES[action]}]
                 second = await self._one_turn(follow_agent, history, max_turns, runner_kwargs)
                 report.followup = second.result
-                self._write({"type": "followup_end", "sessionKey": session_key, "action": action,
-                             "model": _model_label(model) if model else report.summary.model,
-                             "success": second.summary.success, "toolCalls": second.summary.tool_calls,
-                             "seconds": second.seconds})
-            if self._outcomes:
-                self._outcomes.open(
-                    session_key, agent_id=agent_id, model=report.summary.model, mode=mode, decision=report.decision,
-                    applied=action if second is not None else "none",
-                    run={"success": report.summary.success, "retriable": report.summary.retriable,
-                         "toolCalls": report.summary.tool_calls, "tokens": _tokens(report.result)},
-                    followup=None if second is None else {
-                        "success": second.status == "done", **self._work(second.result), "tokens": _tokens(second.result)})
+                self._followup_end(session_key, action, model_label(model) if model else report.summary.model, second)
+            self._episode(session_key, agent_id, report, _tokens(report.result), second,
+                          self._work(self._calls(second.result)) if second else None,
+                          _tokens(second.result) if second else None)
             return report
         finally:
             _agent_var.reset(agent_token)
@@ -322,12 +185,8 @@ class Xybernetex:
             _agent_var.reset(agent_token)
             _session_var.reset(token)
 
-    def _work(self, result: Any) -> dict:
-        """A run's tool calls, file writes and calls the gate refused, for its outcome."""
-        calls = [self._call_of(i) for i in (result.new_items if result is not None else []) if isinstance(i, ToolCallItem)]
-        refused = [cid for _, cid, _ in calls if (self._decisions.get(cid) or {}).get("block")]
-        writes = sum(1 for name, cid, _ in calls if WRITE_TOOLS.match(name or "") and cid not in refused)
-        return {"toolCalls": len(calls), "writes": writes, "failedCalls": len(refused)}
+    def _calls(self, result: Any) -> list[tuple[str | None, str | None]]:
+        return [self._call_of(i)[:2] for i in (result.new_items if result is not None else []) if isinstance(i, ToolCallItem)]
 
     @staticmethod
     def _call_of(item: Any) -> tuple[str | None, str | None, Any]:
@@ -403,17 +262,6 @@ class Xybernetex:
             return Report(result=result, status="died", error=error, seconds=seconds,
                           summary=RunSummary(success=False, tool_calls=tool_calls, retriable=True, error=error))
         return Report(result=result, status="done", seconds=seconds, summary=RunSummary(success=True, tool_calls=tool_calls))
-
-
-def _model_label(model: Any) -> str | None:
-    """The model's id: the string itself, or a Model object's model name."""
-    if isinstance(model, str):
-        return model or None
-    for attr in ("model", "model_name", "name"):
-        value = getattr(model, attr, None)
-        if isinstance(value, str) and value:
-            return value
-    return None
 
 
 def _tokens(result: Any) -> int | None:
