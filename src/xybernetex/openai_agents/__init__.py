@@ -77,8 +77,16 @@ class Xybernetex(AdapterBase, ContractMixin):
     def _decide(self, tool_name: str, args: Any, call_id: str, agent_name: str | None) -> dict:
         return self._gate_decision(tool_name, args, call_id, self._ctx(agent_name, call_id))
 
+    def _governed(self, tool_name: str, args: Any, call_id: str, wrapper: Any) -> str | None:
+        """The governor's word on a call, with this turn's tokens so far from the run context."""
+        usage = getattr(wrapper, "usage", None)
+        return self._govern(_session_var.get(), call_id, tool_name, args if isinstance(args, dict) else {},
+                            getattr(usage, "total_tokens", None))
+
     def _needs_approval_for(self, tool: FunctionTool) -> Callable:
         async def needs_approval(ctx: Any, args: dict, call_id: str) -> bool:
+            if self._governed(tool.name, args, call_id, ctx):
+                return False  # stopped: the input guardrail turns it away, no one needs to approve it
             agent_name = getattr(getattr(ctx, "agent", None), "name", None)
             return "require_approval" in self._decide(tool.name, args, call_id, agent_name)
         return needs_approval
@@ -95,6 +103,9 @@ class Xybernetex(AdapterBase, ContractMixin):
 
     def _on_tool_input(self, data: Any) -> ToolGuardrailFunctionOutput:
         tc = data.context
+        stop = self._governed(tc.tool_name, self._parse_args(tc), tc.tool_call_id, tc)
+        if stop:
+            return ToolGuardrailFunctionOutput.reject_content(stop, output_info={"xybernetex": "stopped"})
         decision = self._decide(tc.tool_name, self._parse_args(tc), tc.tool_call_id, getattr(data.agent, "name", None))
         if decision.get("block"):
             return ToolGuardrailFunctionOutput.reject_content(decision["block_reason"], output_info={"xybernetex": "blocked"})
@@ -166,7 +177,9 @@ class Xybernetex(AdapterBase, ContractMixin):
             writing = (asyncio.create_task(self._write_contract(contract_model or agent.model, text))
                        if contract == "auto" and text is not None else None)
             guarded = self.guard(agent)
+            self._governed_start(session_key)
             report = await self._one_turn(guarded, run_input, max_turns, runner_kwargs)
+            self._turn_done(session_key, _tokens(report.result))
             report.summary.model = model_label(agent.model)
             agent_id = self._agent_id or agent.name
             self._run_end(session_key, agent_id, report)
@@ -180,10 +193,14 @@ class Xybernetex(AdapterBase, ContractMixin):
                 self._contract_ready(session_key, fixed, error)
             report.contract = fixed
             verdict = None
+            stop = self._stopped(session_key)
             if fixed is not None and report.status != "held":
                 verdict = await self._check_contract(session_key, fixed, run_checks, 0)
                 report.verdicts.append(verdict)
                 report.final_verdict = verdict
+            if stop and report.status != "held":
+                report.decision = self._stop_decision(session_key, agent_id, report, stop)
+            elif verdict is not None:
                 report.decision = self._contract_decision(session_key, agent_id, report, verdict)
             else:
                 report.decision = await self._decide_after(session_key, agent_id, report)
@@ -206,6 +223,7 @@ class Xybernetex(AdapterBase, ContractMixin):
                     rep = await self._one_turn(follow_agent, history["items"] + [{"role": "user", "content": message}],
                                                max_turns, runner_kwargs)
                     report.followup = rep.result
+                    self._turn_done(session_key, _tokens(rep.result))
                     self._followup_end(session_key, action, label, rep)
                     if rep.result is not None:
                         history["items"] = rep.result.to_input_list()
@@ -273,6 +291,12 @@ class Xybernetex(AdapterBase, ContractMixin):
                     args = json.loads(arguments) if isinstance(arguments, str) and arguments else (arguments or {})
                 except ValueError:
                     args = {}
+                stop = self._governed(name, args, call_id, getattr(result, "context_wrapper", None))
+                if stop:
+                    state = state or result.to_state()
+                    state.reject(item, rejection_message=stop)
+                    settled += 1
+                    continue
                 decision = self._decide(name, args, call_id, getattr(agent, "name", None))
                 if decision.get("require_approval"):
                     continue  # now a hold with a reason, left for the host

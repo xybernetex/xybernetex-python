@@ -159,8 +159,23 @@ class Xybernetex(AdapterBase, ContractMixin):
         else:
             self._resolve_hold(call_id, "allow-once")
 
+    def _governed(self, request: Any) -> ToolMessage | None:
+        """The governor's stop, as the tool's result; None when the call may go on to the gate."""
+        if self._governor is None:
+            return None
+        tc = request.tool_call
+        turn = _this_turn(request.state)
+        tokens = sum(int((m.usage_metadata or {}).get("total_tokens") or 0) for m in turn
+                     if isinstance(m, AIMessage) and getattr(m, "usage_metadata", None))
+        stop = self._govern(self._session(request), tc.get("id") or "", tc.get("name"), tc.get("args") or {}, tokens)
+        return None if stop is None else ToolMessage(content=stop, tool_call_id=tc.get("id") or "", name=tc.get("name"),
+                                                     status="error")
+
     def wrap_tool_call(self, request: Any, execute: Any) -> Any:
-        """ToolNode(wrap_tool_call=...): the gate before, the bookkeeping after."""
+        """ToolNode(wrap_tool_call=...): the governor and the gate before, the bookkeeping after."""
+        stopped = self._governed(request)
+        if stopped is not None:
+            return stopped
         name, args, call_id, ctx, decision = self._before(request)
         refused = self._refusal(name, call_id, decision)
         if refused is not None:
@@ -171,6 +186,9 @@ class Xybernetex(AdapterBase, ContractMixin):
 
     async def awrap_tool_call(self, request: Any, execute: Any) -> Any:
         """ToolNode(awrap_tool_call=...): the same, for async graphs."""
+        stopped = self._governed(request)
+        if stopped is not None:
+            return stopped
         name, args, call_id, ctx, decision = self._before(request)
         refused = self._refusal(name, call_id, decision)
         if refused is not None:
@@ -223,7 +241,9 @@ class Xybernetex(AdapterBase, ContractMixin):
             fixed = self._contract_from(contract)
             writing = (asyncio.create_task(self._write_contract(contract_model, text))
                        if contract == "auto" and text is not None and contract_model is not None else None)
+            self._governed_start(session)
             report = await self._one_turn(graph, inp, config)
+            self._turn_done(session, _tokens(report.result))
             report.summary.model = model_label(model) if model is not None else None
             agent_id = self._agent_id
             self._run_end(session, agent_id, report)
@@ -237,10 +257,14 @@ class Xybernetex(AdapterBase, ContractMixin):
                 self._contract_ready(session, fixed, error)
             report.contract = fixed
             verdict = None
+            stop = self._stopped(session)
             if fixed is not None and report.status != "held":
                 verdict = await self._check_contract(session, fixed, run_checks, 0)
                 report.verdicts.append(verdict)
                 report.final_verdict = verdict
+            if stop and report.status != "held":
+                report.decision = self._stop_decision(session, agent_id, report, stop)
+            elif verdict is not None:
                 report.decision = self._contract_decision(session, agent_id, report, verdict)
             else:
                 report.decision = await self._decide_after(session, agent_id, report)
@@ -260,6 +284,7 @@ class Xybernetex(AdapterBase, ContractMixin):
                     rep = await self._one_turn(target, {"messages": [*history["messages"], HumanMessage(message)]},
                                                follow_config)
                     report.followup = rep.result
+                    self._turn_done(session, _tokens(rep.result))
                     self._followup_end(session, action, label, rep)
                     if rep.result is not None:
                         history["messages"] = _messages(rep.result)

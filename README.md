@@ -99,6 +99,7 @@ experiment run replayed through both implementations, identical results):
 | `core/policy.py` | the policy-service client (`/intervene`, `/outcome`) | 6 | wire format = the plugin's; summaries pass the service's validator |
 | `core/contracts.py` | acceptance checks: parse, refuse unsafe, run, the fix message | 10 + 8 end-to-end | - |
 | `core/ratchet.py` | keep or undo each fix by which checks pass; folder snapshots | 5 | - |
+| `core/governor.py` | budgets, repeats and no-progress stops | 7 + 4 end-to-end | - |
 | `core/outcomes.py` | episodes: what happened after a decision | 8 | the plugin's classifier cases; episodes pass the service's validator |
 | `openai_agents/` | the OpenAI Agents SDK adapter | 13 end-to-end | scripted model through real `Runner.run` |
 | `langgraph/` | the LangGraph adapter | 11 end-to-end | scripted chat model through a real ReAct graph, interrupts and resumes |
@@ -157,6 +158,24 @@ turn naming exactly what failed. With `snapshots`, every fix turn is under
 the ratchet: a fix that makes a passing check fail is undone and the agent
 is told, so a run's progress only goes up. `after_first=` lets you grade or
 snapshot the first turn before anything else touches the workspace.
+
+## The governor
+
+```python
+xyb = Xybernetex(mode="enforce", preset="recommended", governor="standard")
+# or governor={"max_tool_calls": 100, "max_tokens": 500_000, "max_seconds": 1800,
+#              "repeat_limit": 4, "no_progress_rounds": 2}
+report.governor          # None, or why the run was stopped
+```
+
+Deterministic stops for runs that spend without progress, counted across
+everything one `xyb.run` does (first turn, follow-ups, fix rounds): a budget
+of tool calls, tokens or wall-clock time, the same call made several times
+in a row, or fix rounds that keep failing to improve the contract. The call
+that crosses a limit, and every call after it, is answered with a plain
+"stop and summarize" instead of running, and no follow-up starts. Off by
+default; `"standard"` is 150 calls, 1.5M tokens, an hour, 4 repeats, 2
+rounds without progress.
 
 ## Development
 

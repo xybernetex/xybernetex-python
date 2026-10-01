@@ -19,6 +19,7 @@ from .core.contracts import Contract, ContractError, Verdict, failure_message, p
 from .core.ratchet import REGRESSED, ROLLED_BACK, judge, passing, rollback_message
 from .core.control import ToolGate
 from .core.followups import RunSummary, decide_local, is_ours
+from .core.governor import Governor, limits_from
 from .core.outcomes import WRITE_TOOLS, OutcomeTracker
 from .core.policy import DEFAULT_ENDPOINT, OutcomeSender, RemoteDecider
 
@@ -40,6 +41,7 @@ class Report:
     verdicts: list = field(default_factory=list)  # one Verdict per check round: after the run, after each fix
     contract_tokens: int | None = None      # what writing a generated contract cost
     ratchet: list = field(default_factory=list)   # per fix round: improved | same | regressed | rolled-back
+    governor: str | None = None             # why the governor stopped the run, if it did
     final_verdict: Any = None               # the checks on the workspace the run ended with
 
     @property
@@ -54,13 +56,14 @@ class AdapterBase:
     def __init__(self, *, mode: str = "observe", preset: str | None = "recommended", rules: list[dict] | None = None,
                  log: Callable[[dict], Any] | str | os.PathLike | None = None, approvals: bool = True,
                  followups: dict | None = None, agent_id: str | None = None, api_key: str | None = None,
-                 endpoint: str | None = None) -> None:
+                 endpoint: str | None = None, governor: Any = None) -> None:
         """followups: {"mode": "off"|"observe"|"act", "model": the follow-up turn's model,
         "policy": "remote"|"local" (remote when there's an API key), "share_outcomes": bool
         (default True with an API key), "quiet_minutes": how long a user's silence takes to
         close an episode (30), "decide"/"send": your own decision and outcome functions}.
         api_key defaults to $XYBERNETEX_API_KEY, endpoint to $XYBERNETEX_ENDPOINT or
-        https://api.xybernetex.com."""
+        https://api.xybernetex.com. governor: "standard" or a dict of limits (core/governor.py) to
+        stop runs that spend without progress; off by default."""
         self._log_target = log
         self._approvals = approvals
         self._followups = dict(followups or {})
@@ -89,9 +92,12 @@ class AdapterBase:
                               owns_files=lambda event, ctx: self._authz.owns_files((ctx or {}).get("session_key"),
                                                                                    event.get("tool_name"), event.get("params")))
         self._decisions: dict[str, dict] = {}   # tool_call_id -> the gate's decision for that call
+        limits = limits_from(governor)
+        self._governor = Governor(limits, self._write) if limits else None
         self.rule_ids = self._gate.rule_ids
         self._write({"type": "tool_gate_ready", "mode": mode, "preset": preset or "none", "ruleIds": self.rule_ids,
                      "approvals": approvals, "followups": self._followup_mode,
+                     **({"governor": {k: v for k, v in vars(limits).items() if v is not None}} if limits else {}),
                      **({"policy": "custom" if self._followups.get("decide") else "remote" if remote else "local",
                          "shareOutcomes": send is not None} if self._outcomes else {})})
 
@@ -174,6 +180,33 @@ class AdapterBase:
         refused = [cid for _, cid in calls if (self._decisions.get(cid) or {}).get("block")]
         writes = sum(1 for name, cid in calls if WRITE_TOOLS.match(name or "") and cid not in refused)
         return {"toolCalls": len(calls), "writes": writes, "failedCalls": len(refused)}
+
+    # ---- the governor ------------------------------------------------------------------
+
+    def _govern(self, session_key: str, call_id: str, tool_name: str, params: Any, turn_tokens: int | None) -> str | None:
+        """Before a tool call: the governor's stop message, or None to go on to the gate."""
+        if self._governor is None:
+            return None
+        return self._governor.on_call(session_key, call_id, tool_name, params, turn_tokens)
+
+    def _governed_start(self, session_key: str) -> None:
+        if self._governor is not None:
+            self._governor.start(session_key)
+
+    def _turn_done(self, session_key: str, tokens: int | None) -> None:
+        if self._governor is not None:
+            self._governor.turn_done(session_key, tokens)
+
+    def _stopped(self, session_key: str) -> str | None:
+        return self._governor.stopped(session_key) if self._governor is not None else None
+
+    def _stop_decision(self, session_key: str, agent_id: str | None, report: Report, kind: str) -> dict:
+        """A stopped run gets no follow-up."""
+        report.governor = kind
+        decision = {"action": "none", "probability": 1.0, "rule": f"governor-{kind}", "policy": "governor"}
+        self._write({"type": "intervention", "sessionKey": session_key, "agentId": agent_id, "mode": self._followup_mode,
+                     "model": report.summary.model, **decision})
+        return decision
 
     # ---- after a run: the decision and its episode ------------------------------------
 
@@ -271,6 +304,8 @@ class ContractMixin:
         contract is met, the turn produced nothing, or max_fixes rounds have run."""
         best, last, message = verdict, None, self._fix_message(verdict)
         for round_no in range(1, max_fixes + 1):
+            if self._stopped(session_key):
+                break
             token = None
             if snapshots is not None:
                 try:
@@ -300,7 +335,9 @@ class ContractMixin:
             report.final_verdict = best
             self._write({"type": "ratchet", "sessionKey": session_key, "round": round_no, "outcome": outcome,
                          "passed": len(passing(new)), "kept": len(passing(best)), "checks": len(new.results)})
-            if best.passed or last.result is None:
+            if self._governor is not None and self._governor.on_round(session_key, outcome):
+                report.governor = self._stopped(session_key)
+            if best.passed or last.result is None or report.governor:
                 break
         return last
 
