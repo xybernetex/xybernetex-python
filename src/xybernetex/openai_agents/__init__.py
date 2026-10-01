@@ -37,6 +37,7 @@ files or command text.
 """
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import dataclasses
 import json
@@ -47,7 +48,8 @@ from agents import Agent, FunctionTool, Runner, ToolGuardrailFunctionOutput, Too
 from agents.exceptions import MaxTurnsExceeded
 from agents.items import ToolCallItem
 
-from .._adapter import AdapterBase, Report, model_label
+from .._adapter import AdapterBase, ContractMixin, Report, model_label
+from ..core.contracts import Contract, contract_prompt
 from ..core.deaths import retriable
 from ..core.followups import MESSAGES, RunSummary
 
@@ -57,7 +59,7 @@ _session_var: contextvars.ContextVar[str] = contextvars.ContextVar("xybernetex_s
 _agent_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("xybernetex_agent", default=None)
 
 
-class Xybernetex(AdapterBase):
+class Xybernetex(AdapterBase, ContractMixin):
 
 
     def __init__(self, **kwargs: Any) -> None:
@@ -138,35 +140,71 @@ class Xybernetex(AdapterBase):
         return None
 
     async def run(self, agent: Agent, run_input: Any, *, session_key: str = "default", max_turns: int | None = None,
-                  followup_model: Any = None, **runner_kwargs: Any) -> Report:
-        """Runner.run with the gate on, then outcome bookkeeping and the follow-up decision."""
+                  followup_model: Any = None, contract: Any = None, run_checks: Any = None, contract_model: Any = None,
+                  max_fixes: int = 1, **runner_kwargs: Any) -> Report:
+        """Runner.run with the gate on, then outcome bookkeeping and the follow-up decision.
+
+        contract: a developer contract (core.contracts.Contract, or {"checks": [...]}) or "auto" (written by
+        contract_model, default the agent's own model, while the agent runs). With one, the follow-up is
+        decided by the checks, run through run_checks(command, timeout) -> (exit code, output) when the run
+        ends: all pass -> done; any fail -> up to max_fixes targeted fix turns, each re-checked."""
+        if contract is not None and run_checks is None:
+            raise ValueError("a contract needs run_checks=(command, timeout) -> (exit code, output)")
         token = _session_var.set(session_key)
         agent_token = _agent_var.set(getattr(agent, "name", None))
         try:
             text = self._user_text(run_input)
             if text is not None:
                 self.note_user_message(session_key, text)
+            fixed = self._contract_from(contract)
+            writing = (asyncio.create_task(self._write_contract(contract_model or agent.model, text))
+                       if contract == "auto" and text is not None else None)
             guarded = self.guard(agent)
             report = await self._one_turn(guarded, run_input, max_turns, runner_kwargs)
             report.summary.model = model_label(agent.model)
             agent_id = self._agent_id or agent.name
             self._run_end(session_key, agent_id, report)
-            report.decision = await self._decide_after(session_key, agent_id, report)
+            if contract is not None:
+                error = None
+                if writing is not None:
+                    fixed, error, report.contract_tokens = await writing
+                elif contract == "auto":
+                    error = "no user text to write a contract from"
+                self._contract_ready(session_key, fixed, error)
+            report.contract = fixed
+            verdict = None
+            if fixed is not None and report.status != "held":
+                verdict = await self._check_contract(session_key, fixed, run_checks, 0)
+                report.verdicts.append(verdict)
+                report.decision = self._contract_decision(session_key, agent_id, report, verdict)
+            else:
+                report.decision = await self._decide_after(session_key, agent_id, report)
             if report.decision is None:
                 return report
             second = None
             action = report.decision["action"]
-            if self._followup_mode == "act" and action in MESSAGES and (report.result is not None or action == "retry"):
+            fixing = verdict is not None and not verdict.passed
+            if (self._followup_mode == "act" and action in MESSAGES
+                    and (report.result is not None or action == "retry" or fixing)):
                 model = followup_model or self._followups.get("model")
                 follow_agent = guarded.clone(model=model) if model else guarded
-                # A run that raised has no transcript: the retry starts from the
+                # A run that raised has no transcript: the follow-up starts from the
                 # original input (the files it changed are still there).
                 before = (report.result.to_input_list() if report.result is not None
                           else [{"role": "user", "content": run_input}] if isinstance(run_input, str) else list(run_input))
-                history = before + [{"role": "user", "content": MESSAGES[action]}]
-                second = await self._one_turn(follow_agent, history, max_turns, runner_kwargs)
-                report.followup = second.result
-                self._followup_end(session_key, action, model_label(model) if model else report.summary.model, second)
+                message = self._fix_message(verdict) if fixing else MESSAGES[action]
+                for round_no in range(1, (max_fixes if fixing else 1) + 1):
+                    second = await self._one_turn(follow_agent, before + [{"role": "user", "content": message}],
+                                                  max_turns, runner_kwargs)
+                    report.followup = second.result
+                    self._followup_end(session_key, action, model_label(model) if model else report.summary.model, second)
+                    if not fixing:
+                        break
+                    verdict = await self._check_contract(session_key, fixed, run_checks, round_no)
+                    report.verdicts.append(verdict)
+                    if verdict.passed or second.result is None:
+                        break
+                    before, message = second.result.to_input_list(), self._fix_message(verdict)
             self._episode(session_key, agent_id, report, _tokens(report.result), second,
                           self._work(self._calls(second.result)) if second else None,
                           _tokens(second.result) if second else None)
@@ -174,6 +212,17 @@ class Xybernetex(AdapterBase):
         finally:
             _agent_var.reset(agent_token)
             _session_var.reset(token)
+
+    async def _write_contract(self, model: Any, text: str) -> tuple[Contract | None, str | None, int | None]:
+        """One call on the given model: the request -> a generated contract (no tools, one turn)."""
+        writer = Agent(name="xybernetex-contract", instructions="You write acceptance checks. Reply with JSON only.",
+                       model=model)
+        try:
+            result = await Runner.run(writer, contract_prompt(text), max_turns=1)
+        except Exception as e:  # noqa: BLE001 - no contract: the run is decided the usual way
+            return None, f"{type(e).__name__}: {e}"[:200], None
+        parsed, error = self._parse_reply(result.final_output)
+        return parsed, error, _tokens(result)
 
     async def resume(self, agent: Agent, state: Any, *, session_key: str = "default", **runner_kwargs: Any) -> Report:
         """Continue a run that paused for approval, after approve/reject on its RunState."""

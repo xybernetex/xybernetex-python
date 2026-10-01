@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .core.authz import AuthorizationTracker
+from .core.contracts import Contract, ContractError, Verdict, failure_message, parse_contract, parse_generated, run_checks
 from .core.control import ToolGate
 from .core.followups import RunSummary, decide_local, is_ours
 from .core.outcomes import WRITE_TOOLS, OutcomeTracker
@@ -34,6 +35,14 @@ class Report:
     followup: Any = None                    # the follow-up turn's result, if one ran
     seconds: float = 0.0
     interruptions: list = field(default_factory=list)
+    contract: Contract | None = None        # the run's contract, if it had one
+    verdicts: list = field(default_factory=list)  # one Verdict per check round: after the run, after each fix
+    contract_tokens: int | None = None      # what writing a generated contract cost
+
+    @property
+    def contract_met(self) -> bool | None:
+        """Whether the last check round passed (None without a contract)."""
+        return self.verdicts[-1].passed if self.verdicts else None
 
 
 class AdapterBase:
@@ -197,6 +206,50 @@ class AdapterBase:
                  "toolCalls": report.summary.tool_calls, "tokens": run_tokens},
             followup=None if second is None else {"success": second.status == "done", **(second_work or {}),
                                                   "tokens": second_tokens})
+
+
+class ContractMixin:
+    """The contract loop both adapters share: resolve the contract, check it,
+    decide from the verdict. Running a turn stays with each adapter."""
+
+    def _contract_from(self, contract: Any) -> Contract | None:
+        """A developer contract (Contract, dict or list) -> Contract; anything else -> None."""
+        if contract is None or contract == "auto":
+            return None
+        if isinstance(contract, Contract):
+            return contract
+        return parse_contract(contract, source="developer")
+
+    def _contract_ready(self, session_key: str, contract: Contract | None, error: str | None = None) -> None:
+        if contract is None:
+            self._write({"type": "contract_unavailable", "sessionKey": session_key, "reason": (error or "none")[:200]})
+            return
+        self._write({"type": "contract", "sessionKey": session_key, "source": contract.source,
+                     "contract": contract.hash, "checks": len(contract.checks), "refused": len(contract.refused)})
+
+    @staticmethod
+    def _parse_reply(reply: Any) -> tuple[Contract | None, str | None]:
+        try:
+            return parse_generated(reply if isinstance(reply, str) else str(reply or "")), None
+        except ContractError as e:
+            return None, str(e)
+
+    async def _check_contract(self, session_key: str, contract: Contract, executor: Any, round_no: int) -> Verdict:
+        verdict = await asyncio.to_thread(run_checks, contract, executor)
+        self._write({"type": "contract_check", "sessionKey": session_key, "round": round_no, **verdict.summary()})
+        return verdict
+
+    def _contract_decision(self, session_key: str, agent_id: str | None, report: Report, verdict: Verdict) -> dict:
+        """The verdict decides: met -> nothing more; failed -> a fix turn (a targeted verify)."""
+        decision = {"action": "none" if verdict.passed else "verify", "probability": 1.0,
+                    "rule": "contract-met" if verdict.passed else "contract-failed", "policy": "contract"}
+        self._write({"type": "intervention", "sessionKey": session_key, "agentId": agent_id, "mode": self._followup_mode,
+                     "model": report.summary.model, **decision})
+        return decision
+
+    @staticmethod
+    def _fix_message(verdict: Verdict) -> str:
+        return failure_message(verdict)
 
 
 def model_label(model: Any) -> str | None:

@@ -50,7 +50,8 @@ from langgraph.errors import GraphRecursionError
 from langgraph.prebuilt import ToolNode
 from langgraph.types import Command, interrupt
 
-from .._adapter import AdapterBase, Report, model_label
+from .._adapter import AdapterBase, ContractMixin, Report, model_label
+from ..core.contracts import Contract, contract_prompt
 from ..core.deaths import retriable
 from ..core.followups import MESSAGES, RunSummary, is_ours
 
@@ -90,7 +91,7 @@ def _answer(value: Any) -> str:
     return "allow-once" if isinstance(value, str) and value.strip().lower() in _ALLOW else "deny"
 
 
-class Xybernetex(AdapterBase):
+class Xybernetex(AdapterBase, ContractMixin):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._last_user: dict[str, str] = {}  # session -> the last user text noted (so state reads don't repeat it)
@@ -189,43 +190,90 @@ class Xybernetex(AdapterBase):
         return run_input
 
     async def run(self, graph: Any, run_input: Any, *, config: dict | None = None, session_key: str | None = None,
-                  followup_graph: Any = None, model: Any = None) -> Report:
+                  followup_graph: Any = None, model: Any = None, contract: Any = None, run_checks: Any = None,
+                  contract_model: Any = None, max_fixes: int = 1) -> Report:
         """graph.ainvoke with the gate on, then outcome bookkeeping and the follow-up decision.
-        `model` labels the run's model for decisions and outcomes (a model object or id)."""
+        `model` labels the run's model for decisions and outcomes (a model object or id).
+
+        contract: a developer contract (core.contracts.Contract, or {"checks": [...]}) or "auto", written by
+        contract_model (a LangChain chat model) while the graph runs. With one, the follow-up is decided by
+        the checks, run through run_checks(command, timeout) -> (exit code, output) when the run ends: all
+        pass -> done; any fail -> up to max_fixes targeted fix turns, each re-checked."""
+        if contract is not None and run_checks is None:
+            raise ValueError("a contract needs run_checks=(command, timeout) -> (exit code, output)")
         config = dict(config or {})
         configurable = dict(config.get("configurable") or {})
         session = session_key or str(configurable.get("thread_id") or "default")
         token = _session_var.set(session)
         try:
             inp = self._as_input(run_input)
+            text = None
             for m in reversed(_messages(inp)):
                 if isinstance(m, HumanMessage) or (isinstance(m, tuple) and m[0] in ("user", "human")):
                     text = _text(m[1]) if isinstance(m, tuple) else _text(m)
                     if not is_ours(text):
                         self._note(session, text)
                     break
+            fixed = self._contract_from(contract)
+            writing = (asyncio.create_task(self._write_contract(contract_model, text))
+                       if contract == "auto" and text is not None and contract_model is not None else None)
             report = await self._one_turn(graph, inp, config)
             report.summary.model = model_label(model) if model is not None else None
             agent_id = self._agent_id
             self._run_end(session, agent_id, report)
-            report.decision = await self._decide_after(session, agent_id, report)
+            if contract is not None:
+                error = None
+                if writing is not None:
+                    fixed, error, report.contract_tokens = await writing
+                elif contract == "auto":
+                    error = "contract='auto' needs contract_model" if contract_model is None else "no user text"
+                self._contract_ready(session, fixed, error)
+            report.contract = fixed
+            verdict = None
+            if fixed is not None and report.status != "held":
+                verdict = await self._check_contract(session, fixed, run_checks, 0)
+                report.verdicts.append(verdict)
+                report.decision = self._contract_decision(session, agent_id, report, verdict)
+            else:
+                report.decision = await self._decide_after(session, agent_id, report)
             if report.decision is None:
                 return report
             second = None
             action = report.decision["action"]
+            fixing = verdict is not None and not verdict.passed
             if self._followup_mode == "act" and action in MESSAGES:
                 history = _messages(report.result) if report.result is not None else _messages(inp)
-                follow_config = {**config, "configurable": {**configurable,
-                                                            "thread_id": f"{session}{_FOLLOWUP_THREAD}{action}-{time.time_ns()}"}}
                 target = followup_graph or self._followups.get("graph") or graph
-                second = await self._one_turn(target, {"messages": [*history, HumanMessage(MESSAGES[action])]}, follow_config)
-                report.followup = second.result
-                self._followup_end(session, action, model_label(self._followups.get("model")) or report.summary.model, second)
+                message = self._fix_message(verdict) if fixing else MESSAGES[action]
+                for round_no in range(1, (max_fixes if fixing else 1) + 1):
+                    follow_config = {**config, "configurable": {
+                        **configurable, "thread_id": f"{session}{_FOLLOWUP_THREAD}{action}-{time.time_ns()}"}}
+                    second = await self._one_turn(target, {"messages": [*history, HumanMessage(message)]}, follow_config)
+                    report.followup = second.result
+                    self._followup_end(session, action, model_label(self._followups.get("model")) or report.summary.model,
+                                       second)
+                    if not fixing:
+                        break
+                    verdict = await self._check_contract(session, fixed, run_checks, round_no)
+                    report.verdicts.append(verdict)
+                    if verdict.passed or second.result is None:
+                        break
+                    history, message = _messages(second.result), self._fix_message(verdict)
             self._episode(session, agent_id, report, _tokens(report.result), second,
                           self._work(_calls(second.result)) if second else None, _tokens(second.result) if second else None)
             return report
         finally:
             _session_var.reset(token)
+
+    async def _write_contract(self, chat_model: Any, text: str) -> tuple[Contract | None, str | None, int | None]:
+        """One call on a LangChain chat model: the request -> a generated contract."""
+        try:
+            reply = await chat_model.ainvoke([HumanMessage(contract_prompt(text))])
+        except Exception as e:  # noqa: BLE001 - no contract: the run is decided the usual way
+            return None, f"{type(e).__name__}: {e}"[:200], None
+        parsed, error = self._parse_reply(_text(reply))
+        usage = getattr(reply, "usage_metadata", None) or {}
+        return parsed, error, int(usage.get("total_tokens") or 0) or None
 
     async def resume(self, graph: Any, answer: Any, *, config: dict, session_key: str | None = None) -> Report:
         """Answer a held call ("allow-once" / "deny", or True / False) and continue the run."""
