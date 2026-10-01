@@ -191,7 +191,7 @@ class Xybernetex(AdapterBase, ContractMixin):
 
     async def run(self, graph: Any, run_input: Any, *, config: dict | None = None, session_key: str | None = None,
                   followup_graph: Any = None, model: Any = None, contract: Any = None, run_checks: Any = None,
-                  contract_model: Any = None, max_fixes: int = 1, after_first: Any = None) -> Report:
+                  contract_model: Any = None, max_fixes: int = 1, after_first: Any = None, snapshots: Any = None) -> Report:
         """graph.ainvoke with the gate on, then outcome bookkeeping and the follow-up decision.
         `model` labels the run's model for decisions and outcomes (a model object or id).
 
@@ -201,7 +201,10 @@ class Xybernetex(AdapterBase, ContractMixin):
         pass -> done; any fail -> up to max_fixes targeted fix turns, each re-checked.
 
         after_first(report), sync or async, runs right after the first turn - before any check or follow-up
-        touches the workspace - e.g. to grade or snapshot what the first turn alone produced."""
+        touches the workspace - e.g. to grade or snapshot what the first turn alone produced.
+
+        snapshots (snapshot() -> token, restore(token), discard(token); see core/ratchet.py) puts fix turns
+        under the ratchet: a fix that makes a passing check fail is undone, and the agent is told."""
         if contract is not None and run_checks is None:
             raise ValueError("a contract needs run_checks=(command, timeout) -> (exit code, output)")
         config = dict(config or {})
@@ -237,6 +240,7 @@ class Xybernetex(AdapterBase, ContractMixin):
             if fixed is not None and report.status != "held":
                 verdict = await self._check_contract(session, fixed, run_checks, 0)
                 report.verdicts.append(verdict)
+                report.final_verdict = verdict
                 report.decision = self._contract_decision(session, agent_id, report, verdict)
             else:
                 report.decision = await self._decide_after(session, agent_id, report)
@@ -246,23 +250,22 @@ class Xybernetex(AdapterBase, ContractMixin):
             action = report.decision["action"]
             fixing = verdict is not None and not verdict.passed
             if self._followup_mode == "act" and action in MESSAGES:
-                history = _messages(report.result) if report.result is not None else _messages(inp)
+                history = {"messages": _messages(report.result) if report.result is not None else _messages(inp)}
                 target = followup_graph or self._followups.get("graph") or graph
-                message = self._fix_message(verdict) if fixing else MESSAGES[action]
-                for round_no in range(1, (max_fixes if fixing else 1) + 1):
+                label = model_label(self._followups.get("model")) or report.summary.model
+
+                async def turn(message: str) -> Report:
                     follow_config = {**config, "configurable": {
                         **configurable, "thread_id": f"{session}{_FOLLOWUP_THREAD}{action}-{time.time_ns()}"}}
-                    second = await self._one_turn(target, {"messages": [*history, HumanMessage(message)]}, follow_config)
-                    report.followup = second.result
-                    self._followup_end(session, action, model_label(self._followups.get("model")) or report.summary.model,
-                                       second)
-                    if not fixing:
-                        break
-                    verdict = await self._check_contract(session, fixed, run_checks, round_no)
-                    report.verdicts.append(verdict)
-                    if verdict.passed or second.result is None:
-                        break
-                    history, message = _messages(second.result), self._fix_message(verdict)
+                    rep = await self._one_turn(target, {"messages": [*history["messages"], HumanMessage(message)]},
+                                               follow_config)
+                    report.followup = rep.result
+                    self._followup_end(session, action, label, rep)
+                    if rep.result is not None:
+                        history["messages"] = _messages(rep.result)
+                    return rep
+                second = (await self._fix_rounds(session, report, fixed, run_checks, verdict, max_fixes, snapshots, turn)
+                          if fixing else await turn(MESSAGES[action]))
             self._episode(session, agent_id, report, _tokens(report.result), second,
                           self._work(_calls(second.result)) if second else None, _tokens(second.result) if second else None)
             return report

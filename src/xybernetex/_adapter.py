@@ -16,6 +16,7 @@ from typing import Any, Callable
 
 from .core.authz import AuthorizationTracker
 from .core.contracts import Contract, ContractError, Verdict, failure_message, parse_contract, parse_generated, run_checks
+from .core.ratchet import REGRESSED, ROLLED_BACK, judge, passing, rollback_message
 from .core.control import ToolGate
 from .core.followups import RunSummary, decide_local, is_ours
 from .core.outcomes import WRITE_TOOLS, OutcomeTracker
@@ -38,10 +39,14 @@ class Report:
     contract: Contract | None = None        # the run's contract, if it had one
     verdicts: list = field(default_factory=list)  # one Verdict per check round: after the run, after each fix
     contract_tokens: int | None = None      # what writing a generated contract cost
+    ratchet: list = field(default_factory=list)   # per fix round: improved | same | regressed | rolled-back
+    final_verdict: Any = None               # the checks on the workspace the run ended with
 
     @property
     def contract_met(self) -> bool | None:
-        """Whether the last check round passed (None without a contract)."""
+        """Whether the workspace the run ended with passes its contract (None without one)."""
+        if self.final_verdict is not None:
+            return self.final_verdict.passed
         return self.verdicts[-1].passed if self.verdicts else None
 
 
@@ -258,6 +263,46 @@ class ContractMixin:
     @staticmethod
     def _fix_message(verdict: Verdict) -> str:
         return failure_message(verdict)
+
+    async def _fix_rounds(self, session_key: str, report: Report, contract: Contract, executor: Any, verdict: Verdict,
+                          max_fixes: int, snapshots: Any, turn: Any) -> Report | None:
+        """Fix turns under the ratchet (core/ratchet.py): snapshot, `turn(message)` (the adapter's
+        one fix turn, which keeps its own history), check, then keep or restore. Stops when the
+        contract is met, the turn produced nothing, or max_fixes rounds have run."""
+        best, last, message = verdict, None, self._fix_message(verdict)
+        for round_no in range(1, max_fixes + 1):
+            token = None
+            if snapshots is not None:
+                try:
+                    token = await asyncio.to_thread(snapshots.snapshot)
+                except Exception as e:  # noqa: BLE001 - no snapshot: this round runs unprotected
+                    self._write({"type": "snapshot_failed", "sessionKey": session_key, "round": round_no,
+                                 "error": f"{type(e).__name__}"})
+            last = await turn(message)
+            new = await self._check_contract(session_key, contract, executor, round_no)
+            report.verdicts.append(new)
+            outcome = judge(best, new)
+            if outcome == REGRESSED and token is not None:
+                try:
+                    await asyncio.to_thread(snapshots.restore, token)
+                    outcome, message = ROLLED_BACK, rollback_message(best, new)
+                except Exception as e:  # noqa: BLE001 - couldn't restore: the workspace is what the turn left
+                    self._write({"type": "restore_failed", "sessionKey": session_key, "round": round_no,
+                                 "error": f"{type(e).__name__}"})
+            if outcome != ROLLED_BACK:
+                best, message = new, self._fix_message(new)
+            if token is not None:
+                try:
+                    await asyncio.to_thread(snapshots.discard, token)
+                except Exception:  # noqa: BLE001 - a leftover snapshot is harmless
+                    pass
+            report.ratchet.append(outcome)
+            report.final_verdict = best
+            self._write({"type": "ratchet", "sessionKey": session_key, "round": round_no, "outcome": outcome,
+                         "passed": len(passing(new)), "kept": len(passing(best)), "checks": len(new.results)})
+            if best.passed or last.result is None:
+                break
+        return last
 
 
 def model_label(model: Any) -> str | None:

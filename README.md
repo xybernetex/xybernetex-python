@@ -97,6 +97,8 @@ experiment run replayed through both implementations, identical results):
 | `core/control.py` | the gate: rules, presets, holds, blocks | 33 | 1,402 decisions and log actions |
 | `core/followups.py` | the follow-up prompts and local rule | - | same text as the plugin |
 | `core/policy.py` | the policy-service client (`/intervene`, `/outcome`) | 6 | wire format = the plugin's; summaries pass the service's validator |
+| `core/contracts.py` | acceptance checks: parse, refuse unsafe, run, the fix message | 10 + 8 end-to-end | - |
+| `core/ratchet.py` | keep or undo each fix by which checks pass; folder snapshots | 5 | - |
 | `core/outcomes.py` | episodes: what happened after a decision | 8 | the plugin's classifier cases; episodes pass the service's validator |
 | `openai_agents/` | the OpenAI Agents SDK adapter | 13 end-to-end | scripted model through real `Runner.run` |
 | `langgraph/` | the LangGraph adapter | 11 end-to-end | scripted chat model through a real ReAct graph, interrupts and resumes |
@@ -132,6 +134,29 @@ LangChain keeps each reply's finish reason, so here a reply cut off at the
 output limit is recognized as a death, not just an empty one. Not covered
 yet: LangChain 1.0's `create_agent` (it takes middleware instead of a
 `ToolNode`).
+
+## Contracts and the ratchet
+
+A contract says what "done" means for a run, as checks code can run:
+
+```python
+report = await xyb.run(agent, "Write report.csv ...", session_key="s",
+                       contract="auto",            # or {"checks": [{"name": ..., "command": ..., "expect": ...}]}
+                       run_checks=run_in_workspace, # (command, timeout) -> (exit code, output)
+                       snapshots=FolderSnapshots(workdir),  # optional: the ratchet
+                       max_fixes=2)
+report.contract_met      # do the checks pass on the workspace the run ended with?
+report.ratchet           # per fix round: improved | same | regressed | rolled-back
+```
+
+`"auto"` has the agent's own model write the checks while the agent works;
+checks that would change anything (deletes, redirects into files, installs,
+network) are refused. When the run ends the checks run, costing no tokens:
+all pass means done, with no check-your-work turn; any failure gets a fix
+turn naming exactly what failed. With `snapshots`, every fix turn is under
+the ratchet: a fix that makes a passing check fail is undone and the agent
+is told, so a run's progress only goes up. `after_first=` lets you grade or
+snapshot the first turn before anything else touches the workspace.
 
 ## Development
 
