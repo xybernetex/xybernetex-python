@@ -1,27 +1,46 @@
 # xybernetex (Python)
 
-The Xybernetex control plane for Python agent frameworks: the OpenAI Agents
-SDK first, LangGraph next. A port of what the OpenClaw plugin
-(`xybernetex-openclaw`, JavaScript) does, with one shared core and one thin
-adapter per framework.
+A deterministic layer for Python agents built on the OpenAI Agents SDK or
+LangGraph. The model still decides what to do; this layer decides what counts
+as done, what may run, and when to stop. It is the Python port of the OpenClaw
+plugin `xybernetex-openclaw`, with one shared core and a thin adapter per
+framework. MIT licensed. The core has no dependencies and needs no server.
 
-## What it will do
-
-The same three things as the OpenClaw plugin:
+## What it does
 
 - **Safety Gate.** Classify each tool call's risk from what it visibly does
   (a shell command, a file path, a patch), label it with who asked for it
   (the user's own message, the agent's own cleanup, or nobody), and hold
   destructive actions nobody asked for. Instructions planted in files or web
   pages can't authorize themselves; the user's own requests run without a
-  prompt. Runs locally, no API key.
-- **Run outcomes.** Notice when a run died even though the framework reports
-  success (an empty answer, a cut-off answer), and record what the agent did.
-- **Follow-ups.** After a run ends, decide whether it gets one more turn - a
-  retry when it died, a check-your-work turn when it finished, on the run's
-  own model or a stronger one - either by a local rule or by asking the
-  Xybernetex policy service, which sees tool names, hashes and labels, never
-  prompts or files.
+  prompt.
+- **Contracts.** Before the run is judged, the agent's own model turns the
+  request into acceptance checks: read-only shell commands such as
+  `python3 test_totals.py` or `test -f totals.csv`. Checks that would write
+  anything are refused. When the run ends they run on a copy of the
+  workspace, and only a failure gets a fix turn, which names what failed.
+- **The ratchet.** Before each fix turn the workspace is snapshotted. A fix
+  is kept only if every check that passed before still passes; otherwise the
+  folder is restored and the agent is told what its fix broke.
+- **The governor.** Budgets for tool calls, tokens and time, plus stops for
+  the same call repeated in a row and for fix rounds that make no progress.
+  The call that crosses a limit doesn't run, and the agent is told to stop
+  and summarize.
+- **Run outcomes and follow-ups.** Notice when a run died even though the
+  framework reports success (an empty or cut-off answer), and decide whether
+  it gets one more turn: a retry when it died, a check-your-work turn when it
+  finished. A local rule decides by default; the optional Xybernetex policy
+  service sees tool names, hashes and labels, never prompts or files.
+
+Each part is opt-in and works without the others.
+
+## Install
+
+Not on PyPI yet. From a clone:
+
+```bash
+pip install -e ".[openai-agents]"   # or ".[langgraph]"
+```
 
 ## Layout
 
@@ -30,7 +49,7 @@ src/xybernetex/
   core/          framework-independent: risk classification, who-asked labels,
                  held targets, death detection, follow-ups, outcomes, the policy client
   openai_agents/ the adapter for the OpenAI Agents SDK (hooks + tool wrappers)
-  langgraph/     the adapter for LangGraph (later)
+  langgraph/     the adapter for LangGraph (ToolNode wrappers + interrupts)
 tests/           unittest; the JavaScript plugin's tests are the reference
                  cases, translated so both ports behave identically
 ```
@@ -104,9 +123,6 @@ experiment run replayed through both implementations, identical results):
 | `openai_agents/` | the OpenAI Agents SDK adapter | 13 end-to-end | scripted model through real `Runner.run` |
 | `langgraph/` | the LangGraph adapter | 11 end-to-end | scripted chat model through a real ReAct graph, interrupts and resumes |
 
-One deliberate difference from the plugin: an episode in act mode where the
-rule held the follow-up out ("none", probability 0.1) records 0.1, the
-chance it was actually left untreated; the plugin 0.4.1 records 1 there.
 
 Not yet: the report, and LangChain 1.0's `create_agent` middleware. Known gap: the SDK drops the model's
 finish reason, so a cut-off answer looks like a short answer; only an empty
@@ -188,7 +204,7 @@ python -m unittest discover -s tests
 
 The experiment that runs our benchmark tasks through the SDK lives in the
 trainer repo (`xybernetex-trainer/scenarios/sdk_agent.py`), because it needs
-the grader there; it will import this package as the port fills in.
+the grader there. `scenarios/lg_agent.py` is the LangGraph twin.
 
 ## Related repos
 

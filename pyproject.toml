@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "xybernetex"
 version = "0.1.0"
-description = "The Xybernetex control plane for Python agent frameworks: safety gate, run outcomes and follow-ups."
+description = "A deterministic layer for Python agents (OpenAI Agents SDK, LangGraph): safety gate, acceptance contracts, ratchet and governor."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
