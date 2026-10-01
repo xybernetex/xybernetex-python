@@ -48,7 +48,7 @@ from agents import Agent, FunctionTool, Runner, ToolGuardrailFunctionOutput, Too
 from agents.exceptions import MaxTurnsExceeded
 from agents.items import ToolCallItem
 
-from .._adapter import AdapterBase, ContractMixin, Report, model_label
+from .._adapter import AdapterBase, ContractMixin, Report, call_hook, model_label
 from ..core.contracts import Contract, contract_prompt
 from ..core.deaths import retriable
 from ..core.followups import MESSAGES, RunSummary
@@ -141,13 +141,16 @@ class Xybernetex(AdapterBase, ContractMixin):
 
     async def run(self, agent: Agent, run_input: Any, *, session_key: str = "default", max_turns: int | None = None,
                   followup_model: Any = None, contract: Any = None, run_checks: Any = None, contract_model: Any = None,
-                  max_fixes: int = 1, **runner_kwargs: Any) -> Report:
+                  max_fixes: int = 1, after_first: Any = None, **runner_kwargs: Any) -> Report:
         """Runner.run with the gate on, then outcome bookkeeping and the follow-up decision.
 
         contract: a developer contract (core.contracts.Contract, or {"checks": [...]}) or "auto" (written by
         contract_model, default the agent's own model, while the agent runs). With one, the follow-up is
         decided by the checks, run through run_checks(command, timeout) -> (exit code, output) when the run
-        ends: all pass -> done; any fail -> up to max_fixes targeted fix turns, each re-checked."""
+        ends: all pass -> done; any fail -> up to max_fixes targeted fix turns, each re-checked.
+
+        after_first(report), sync or async, runs right after the first turn - before any check or follow-up
+        touches the workspace - e.g. to grade or snapshot what the first turn alone produced."""
         if contract is not None and run_checks is None:
             raise ValueError("a contract needs run_checks=(command, timeout) -> (exit code, output)")
         token = _session_var.set(session_key)
@@ -164,6 +167,7 @@ class Xybernetex(AdapterBase, ContractMixin):
             report.summary.model = model_label(agent.model)
             agent_id = self._agent_id or agent.name
             self._run_end(session_key, agent_id, report)
+            await call_hook(after_first, report)
             if contract is not None:
                 error = None
                 if writing is not None:

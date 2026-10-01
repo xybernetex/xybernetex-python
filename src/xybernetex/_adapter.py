@@ -208,6 +208,14 @@ class AdapterBase:
                                                   "tokens": second_tokens})
 
 
+async def call_hook(hook: Any, report: Report) -> None:
+    """after_first(report): run it (sync or async) between the first turn and anything after it."""
+    if hook is not None:
+        result = hook(report)
+        if asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
+            await result
+
+
 class ContractMixin:
     """The contract loop both adapters share: resolve the contract, check it,
     decide from the verdict. Running a turn stays with each adapter."""

@@ -126,6 +126,21 @@ class ContractRunTest(unittest.TestCase):
             self.assertEqual(report.decision["rule"], "verify", fw)   # the local rule, as without a contract
             self.assertTrue(any(e["type"] == "contract_unavailable" for e in h.logs), fw)
 
+    def test_after_first_runs_before_any_follow_up_touches_the_workspace(self):
+        for fw in ("sdk", "lg"):
+            call, say = self.steps(fw)
+            h, model = self.harness(fw, call("run_command", {"command": "python3 make_report.py"}, "c1"), say("Done."),
+                                    call("run_command", {"command": "python3 fix_totals.py"}, "c2"), say("Fixed."),
+                                    followups={"mode": "act"})
+            seen = []
+
+            async def grade(report):
+                seen.append((report.status, list(h.ran)))
+            h.run("Write report.csv.", contract=CONTRACT, run_checks=Workspace(h.ran, fail_until="python3 fix_totals.py"),
+                  after_first=grade)
+            self.assertEqual(seen, [("done", ["python3 make_report.py"])], fw)   # the fix hadn't run yet
+            self.assertIn("python3 fix_totals.py", h.ran, fw)
+
     def test_a_contract_needs_an_executor(self):
         h, _ = self.harness("sdk", sdkt.say("Done."))
         with self.assertRaises(ValueError):

@@ -50,7 +50,7 @@ from langgraph.errors import GraphRecursionError
 from langgraph.prebuilt import ToolNode
 from langgraph.types import Command, interrupt
 
-from .._adapter import AdapterBase, ContractMixin, Report, model_label
+from .._adapter import AdapterBase, ContractMixin, Report, call_hook, model_label
 from ..core.contracts import Contract, contract_prompt
 from ..core.deaths import retriable
 from ..core.followups import MESSAGES, RunSummary, is_ours
@@ -191,14 +191,17 @@ class Xybernetex(AdapterBase, ContractMixin):
 
     async def run(self, graph: Any, run_input: Any, *, config: dict | None = None, session_key: str | None = None,
                   followup_graph: Any = None, model: Any = None, contract: Any = None, run_checks: Any = None,
-                  contract_model: Any = None, max_fixes: int = 1) -> Report:
+                  contract_model: Any = None, max_fixes: int = 1, after_first: Any = None) -> Report:
         """graph.ainvoke with the gate on, then outcome bookkeeping and the follow-up decision.
         `model` labels the run's model for decisions and outcomes (a model object or id).
 
         contract: a developer contract (core.contracts.Contract, or {"checks": [...]}) or "auto", written by
         contract_model (a LangChain chat model) while the graph runs. With one, the follow-up is decided by
         the checks, run through run_checks(command, timeout) -> (exit code, output) when the run ends: all
-        pass -> done; any fail -> up to max_fixes targeted fix turns, each re-checked."""
+        pass -> done; any fail -> up to max_fixes targeted fix turns, each re-checked.
+
+        after_first(report), sync or async, runs right after the first turn - before any check or follow-up
+        touches the workspace - e.g. to grade or snapshot what the first turn alone produced."""
         if contract is not None and run_checks is None:
             raise ValueError("a contract needs run_checks=(command, timeout) -> (exit code, output)")
         config = dict(config or {})
@@ -221,6 +224,7 @@ class Xybernetex(AdapterBase, ContractMixin):
             report.summary.model = model_label(model) if model is not None else None
             agent_id = self._agent_id
             self._run_end(session, agent_id, report)
+            await call_hook(after_first, report)
             if contract is not None:
                 error = None
                 if writing is not None:
