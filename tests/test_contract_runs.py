@@ -149,3 +149,30 @@ class ContractRunTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ContractWriterSettings(unittest.TestCase):
+    """The SDK adapter hands contract_settings to the agent that writes an "auto" contract."""
+
+    def test_settings_reach_the_writer(self):
+        from unittest import mock
+
+        from agents import ModelSettings
+        from agents.model_settings import Reasoning
+
+        import xybernetex.openai_agents as sdk
+        seen = []
+
+        async def fake_run(agent, *args, **kwargs):
+            seen.append(agent.model_settings)
+            raise RuntimeError("stop here")
+
+        xyb = sdk.Xybernetex.__new__(sdk.Xybernetex)
+        settings = ModelSettings(reasoning=Reasoning(effort="low"))
+        with mock.patch.object(sdk.Runner, "run", fake_run):
+            contract, error, _ = asyncio.run(xyb._write_contract("m", "Write t.", settings))
+            asyncio.run(xyb._write_contract("m", "Write t."))
+        self.assertIsNone(contract)
+        self.assertIn("stop here", error)
+        self.assertEqual(seen[0].reasoning.effort, "low")
+        self.assertIsNone(seen[1].reasoning)

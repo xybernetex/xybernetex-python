@@ -152,7 +152,8 @@ class Xybernetex(AdapterBase, ContractMixin):
 
     async def run(self, agent: Agent, run_input: Any, *, session_key: str = "default", max_turns: int | None = None,
                   followup_model: Any = None, contract: Any = None, run_checks: Any = None, contract_model: Any = None,
-                  max_fixes: int = 1, after_first: Any = None, snapshots: Any = None, **runner_kwargs: Any) -> Report:
+                  max_fixes: int = 1, after_first: Any = None, snapshots: Any = None, contract_settings: Any = None,
+                  **runner_kwargs: Any) -> Report:
         """Runner.run with the gate on, then outcome bookkeeping and the follow-up decision.
 
         contract: a developer contract (core.contracts.Contract, or {"checks": [...]}) or "auto" (written by
@@ -164,7 +165,11 @@ class Xybernetex(AdapterBase, ContractMixin):
         touches the workspace - e.g. to grade or snapshot what the first turn alone produced.
 
         snapshots (snapshot() -> token, restore(token), discard(token); see core/ratchet.py) puts fix turns
-        under the ratchet: a fix that makes a passing check fail is undone, and the agent is told."""
+        under the ratchet: a fix that makes a passing check fail is undone, and the agent is told.
+
+        contract_settings (an agents.ModelSettings) for the call that writes an "auto" contract, e.g.
+        ModelSettings(reasoning=Reasoning(effort="low")): reasoning models can deliberate past their output
+        limit on a detailed request and write nothing (GLM-5.3 Flash did; at low effort it took ~500 tokens)."""
         if contract is not None and run_checks is None:
             raise ValueError("a contract needs run_checks=(command, timeout) -> (exit code, output)")
         token = _session_var.set(session_key)
@@ -174,7 +179,7 @@ class Xybernetex(AdapterBase, ContractMixin):
             if text is not None:
                 self.note_user_message(session_key, text)
             fixed = self._contract_from(contract)
-            writing = (asyncio.create_task(self._write_contract(contract_model or agent.model, text))
+            writing = (asyncio.create_task(self._write_contract(contract_model or agent.model, text, contract_settings))
                        if contract == "auto" and text is not None else None)
             guarded = self.guard(agent)
             self._governed_start(session_key)
@@ -238,10 +243,11 @@ class Xybernetex(AdapterBase, ContractMixin):
             _agent_var.reset(agent_token)
             _session_var.reset(token)
 
-    async def _write_contract(self, model: Any, text: str) -> tuple[Contract | None, str | None, int | None]:
+    async def _write_contract(self, model: Any, text: str, settings: Any = None
+                              ) -> tuple[Contract | None, str | None, int | None]:
         """One call on the given model: the request -> a generated contract (no tools, one turn)."""
         writer = Agent(name="xybernetex-contract", instructions="You write acceptance checks. Reply with JSON only.",
-                       model=model)
+                       model=model, **({"model_settings": settings} if settings is not None else {}))
         try:
             result = await Runner.run(writer, contract_prompt(text), max_turns=1)
         except Exception as e:  # noqa: BLE001 - no contract: the run is decided the usual way
