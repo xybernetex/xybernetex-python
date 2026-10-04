@@ -36,11 +36,14 @@ Each part is opt-in and works without the others.
 
 ## Install
 
-Not on PyPI yet. From a clone:
+Not on PyPI yet. From GitHub:
 
 ```bash
-pip install -e ".[openai-agents]"   # or ".[langgraph]"
+pip install "xybernetex[openai-agents] @ git+https://github.com/xybernetex/xybernetex-python"
+pip install "xybernetex[langgraph] @ git+https://github.com/xybernetex/xybernetex-python"
 ```
+
+Or from a clone: `pip install -e ".[openai-agents]"` (or `".[langgraph]"`).
 
 ## Layout
 
