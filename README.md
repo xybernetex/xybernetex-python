@@ -202,12 +202,16 @@ pip install -e ".[openai-agents]"
 python -m unittest discover -s tests
 ```
 
-The experiment that runs our benchmark tasks through the SDK lives in the
-trainer repo (`xybernetex-trainer/scenarios/sdk_agent.py`), because it needs
-the grader there. `scenarios/lg_agent.py` is the LangGraph twin.
+The benchmark runs that exercise this package through both frameworks live
+with our graders, in a separate (private) experiments repo.
 
-## Related repos
+## Related
 
-- `xybernetex-openclaw` - the OpenClaw plugin this ports.
-- `xybernetex-cfworker` - the policy service (api.xybernetex.com).
-- `xybernetex-trainer` - experiments, graders and the learner.
+- [xybernetex-openclaw](https://github.com/xybernetex/xybernetex-openclaw) -
+  the OpenClaw plugin this ports (`npx xybernetex-openclaw`).
+- The optional policy service at api.xybernetex.com is hosted, not part of
+  this repo. Nothing here needs it.
+
+## License
+
+MIT, see `LICENSE`.

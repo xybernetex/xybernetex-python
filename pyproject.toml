@@ -18,6 +18,7 @@ langgraph = ["langgraph>=1.0"]
 
 [project.urls]
 Homepage = "https://xybernetex.com"
+Repository = "https://github.com/xybernetex/xybernetex-python"
 
 [tool.setuptools.packages.find]
 where = ["src"]
