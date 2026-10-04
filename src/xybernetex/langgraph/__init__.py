@@ -209,7 +209,8 @@ class Xybernetex(AdapterBase, ContractMixin):
 
     async def run(self, graph: Any, run_input: Any, *, config: dict | None = None, session_key: str | None = None,
                   followup_graph: Any = None, model: Any = None, contract: Any = None, run_checks: Any = None,
-                  contract_model: Any = None, max_fixes: int = 1, after_first: Any = None, snapshots: Any = None) -> Report:
+                  contract_model: Any = None, max_fixes: int = 1, after_first: Any = None, snapshots: Any = None,
+                  contract_version: str = "v1", judge_model: Any = None) -> Report:
         """graph.ainvoke with the gate on, then outcome bookkeeping and the follow-up decision.
         `model` labels the run's model for decisions and outcomes (a model object or id).
 
@@ -239,7 +240,7 @@ class Xybernetex(AdapterBase, ContractMixin):
                         self._note(session, text)
                     break
             fixed = self._contract_from(contract)
-            writing = (asyncio.create_task(self._write_contract(contract_model, text))
+            writing = (asyncio.create_task(self._write_contract(contract_model, text, contract_version))
                        if contract == "auto" and text is not None and contract_model is not None else None)
             self._governed_start(session)
             report = await self._one_turn(graph, inp, config)
@@ -257,10 +258,15 @@ class Xybernetex(AdapterBase, ContractMixin):
                 self._contract_ready(session, fixed, error)
             report.contract = fixed
             verdict = None
+            # Only a generated contract is judged: a developer's checks are authoritative.
+            v2 = contract_version == "v2" and contract == "auto" and judge_model is not None and text is not None
             stop = self._stopped(session)
             if fixed is not None and report.status != "held":
                 verdict = await self._check_contract(session, fixed, run_checks, 0)
                 report.verdicts.append(verdict)
+                if not verdict.passed and v2:
+                    verdict = await self._adjudicate(session, report, text, verdict, judge_model, 0)
+                    fixed = report.contract = verdict.contract
                 report.final_verdict = verdict
             if stop and report.status != "held":
                 report.decision = self._stop_decision(session, agent_id, report, stop)
@@ -289,7 +295,8 @@ class Xybernetex(AdapterBase, ContractMixin):
                     if rep.result is not None:
                         history["messages"] = _messages(rep.result)
                     return rep
-                second = (await self._fix_rounds(session, report, fixed, run_checks, verdict, max_fixes, snapshots, turn)
+                second = (await self._fix_rounds(session, report, fixed, run_checks, verdict, max_fixes, snapshots, turn,
+                                                 judge_model if v2 else None, text)
                           if fixing else await turn(MESSAGES[action]))
             self._episode(session, agent_id, report, _tokens(report.result), second,
                           self._work(_calls(second.result)) if second else None, _tokens(second.result) if second else None)
@@ -297,15 +304,26 @@ class Xybernetex(AdapterBase, ContractMixin):
         finally:
             _session_var.reset(token)
 
-    async def _write_contract(self, chat_model: Any, text: str) -> tuple[Contract | None, str | None, int | None]:
+    async def _write_contract(self, chat_model: Any, text: str, version: str = "v1"
+                              ) -> tuple[Contract | None, str | None, int | None]:
         """One call on a LangChain chat model: the request -> a generated contract."""
         try:
-            reply = await chat_model.ainvoke([HumanMessage(contract_prompt(text))])
+            reply = await chat_model.ainvoke([HumanMessage(contract_prompt(text, version))])
         except Exception as e:  # noqa: BLE001 - no contract: the run is decided the usual way
             return None, f"{type(e).__name__}: {e}"[:200], None
-        parsed, error = self._parse_reply(_text(reply))
+        parsed, error = self._parse_reply(_text(reply), text if version == "v2" else None)
         usage = getattr(reply, "usage_metadata", None) or {}
         return parsed, error, int(usage.get("total_tokens") or 0) or None
+
+    async def _ask(self, chat_model: Any, prompt: str) -> tuple[str | None, int | None]:
+        """One tool-less call on a LangChain chat model (the contract judge)."""
+        reply = await chat_model.ainvoke([HumanMessage(prompt)])
+        usage = getattr(reply, "usage_metadata", None) or {}
+        return _text(reply), int(usage.get("total_tokens") or 0) or None
+
+    def _reply_text(self, report: Report | None) -> str | None:
+        final = next((m for m in reversed(_messages(getattr(report, "result", None))) if isinstance(m, AIMessage)), None)
+        return _text(final) if final is not None else None
 
     async def resume(self, graph: Any, answer: Any, *, config: dict, session_key: str | None = None) -> Report:
         """Answer a held call ("allow-once" / "deny", or True / False) and continue the run."""

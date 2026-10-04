@@ -153,7 +153,7 @@ class Xybernetex(AdapterBase, ContractMixin):
     async def run(self, agent: Agent, run_input: Any, *, session_key: str = "default", max_turns: int | None = None,
                   followup_model: Any = None, contract: Any = None, run_checks: Any = None, contract_model: Any = None,
                   max_fixes: int = 1, after_first: Any = None, snapshots: Any = None, contract_settings: Any = None,
-                  **runner_kwargs: Any) -> Report:
+                  contract_version: str = "v1", judge_model: Any = None, **runner_kwargs: Any) -> Report:
         """Runner.run with the gate on, then outcome bookkeeping and the follow-up decision.
 
         contract: a developer contract (core.contracts.Contract, or {"checks": [...]}) or "auto" (written by
@@ -169,7 +169,11 @@ class Xybernetex(AdapterBase, ContractMixin):
 
         contract_settings (an agents.ModelSettings) for the call that writes an "auto" contract, e.g.
         ModelSettings(reasoning=Reasoning(effort="low")): reasoning models can deliberate past their output
-        limit on a detailed request and write nothing (GLM-5.3 Flash did; at low effort it took ~500 tokens)."""
+        limit on a detailed request and write nothing (GLM-5.3 Flash did; at low effort it took ~500 tokens).
+
+        contract_version "v2" (with judge_model): every generated check must quote the request it enforces, a
+        judge model rules on each failed check before any fix (the work is wrong, or the check), and the agent
+        may dispute a check in a fix turn, which the judge decides too. See core/contracts.py."""
         if contract is not None and run_checks is None:
             raise ValueError("a contract needs run_checks=(command, timeout) -> (exit code, output)")
         token = _session_var.set(session_key)
@@ -179,7 +183,8 @@ class Xybernetex(AdapterBase, ContractMixin):
             if text is not None:
                 self.note_user_message(session_key, text)
             fixed = self._contract_from(contract)
-            writing = (asyncio.create_task(self._write_contract(contract_model or agent.model, text, contract_settings))
+            writing = (asyncio.create_task(self._write_contract(contract_model or agent.model, text, contract_settings,
+                                                                    contract_version))
                        if contract == "auto" and text is not None else None)
             guarded = self.guard(agent)
             self._governed_start(session_key)
@@ -198,10 +203,15 @@ class Xybernetex(AdapterBase, ContractMixin):
                 self._contract_ready(session_key, fixed, error)
             report.contract = fixed
             verdict = None
+            # Only a generated contract is judged: a developer's checks are authoritative.
+            v2 = contract_version == "v2" and contract == "auto" and judge_model is not None and text is not None
             stop = self._stopped(session_key)
             if fixed is not None and report.status != "held":
                 verdict = await self._check_contract(session_key, fixed, run_checks, 0)
                 report.verdicts.append(verdict)
+                if not verdict.passed and v2:
+                    verdict = await self._adjudicate(session_key, report, text, verdict, judge_model, 0)
+                    fixed = report.contract = verdict.contract
                 report.final_verdict = verdict
             if stop and report.status != "held":
                 report.decision = self._stop_decision(session_key, agent_id, report, stop)
@@ -233,7 +243,8 @@ class Xybernetex(AdapterBase, ContractMixin):
                     if rep.result is not None:
                         history["items"] = rep.result.to_input_list()
                     return rep
-                second = (await self._fix_rounds(session_key, report, fixed, run_checks, verdict, max_fixes, snapshots, turn)
+                second = (await self._fix_rounds(session_key, report, fixed, run_checks, verdict, max_fixes, snapshots, turn,
+                                                 judge_model if v2 else None, text)
                           if fixing else await turn(MESSAGES[action]))
             self._episode(session_key, agent_id, report, _tokens(report.result), second,
                           self._work(self._calls(second.result)) if second else None,
@@ -243,17 +254,29 @@ class Xybernetex(AdapterBase, ContractMixin):
             _agent_var.reset(agent_token)
             _session_var.reset(token)
 
-    async def _write_contract(self, model: Any, text: str, settings: Any = None
+    async def _write_contract(self, model: Any, text: str, settings: Any = None, version: str = "v1"
                               ) -> tuple[Contract | None, str | None, int | None]:
         """One call on the given model: the request -> a generated contract (no tools, one turn)."""
         writer = Agent(name="xybernetex-contract", instructions="You write acceptance checks. Reply with JSON only.",
                        model=model, **({"model_settings": settings} if settings is not None else {}))
         try:
-            result = await Runner.run(writer, contract_prompt(text), max_turns=1)
+            result = await Runner.run(writer, contract_prompt(text, version), max_turns=1)
         except Exception as e:  # noqa: BLE001 - no contract: the run is decided the usual way
             return None, f"{type(e).__name__}: {e}"[:200], None
-        parsed, error = self._parse_reply(result.final_output)
+        parsed, error = self._parse_reply(result.final_output, text if version == "v2" else None)
         return parsed, error, _tokens(result)
+
+    async def _ask(self, model: Any, prompt: str) -> tuple[str | None, int | None]:
+        """One tool-less call on the given model (the contract judge)."""
+        asker = Agent(name="xybernetex-judge", instructions="You judge acceptance checks. Reply with JSON only.",
+                      model=model)
+        result = await Runner.run(asker, prompt, max_turns=1)
+        output = result.final_output
+        return (output if isinstance(output, str) else str(output or "")), _tokens(result)
+
+    def _reply_text(self, report: Report | None) -> str | None:
+        output = getattr(getattr(report, "result", None), "final_output", None)
+        return output if isinstance(output, str) else (str(output) if output is not None else None)
 
     async def resume(self, agent: Agent, state: Any, *, session_key: str = "default", **runner_kwargs: Any) -> Report:
         """Continue a run that paused for approval, after approve/reject on its RunState."""

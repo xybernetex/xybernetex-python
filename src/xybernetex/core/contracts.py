@@ -85,6 +85,7 @@ class Check:
     command: str
     expect: str | None = None   # regex the combined output must also match
     timeout: int = 60
+    basis: str | None = None    # v2: the words of the request this check enforces (not part of the hash)
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,7 @@ class Contract:
     checks: tuple[Check, ...]
     source: str = "developer"   # developer | generated
     refused: tuple[str, ...] = ()  # why checks were dropped (no command text)
+    overturned: int = 0          # v2: checks a judge ruled wrong and removed (not part of the hash)
 
     @property
     def hash(self) -> str:
@@ -118,7 +120,10 @@ class Verdict:
 
     @property
     def passed(self) -> bool:
-        return bool(self.results) and all(r.passed for r in self.results)
+        if self.results:
+            return all(r.passed for r in self.results)
+        # Never vacuously met - except a contract a judge emptied: every check was overturned as wrong.
+        return not self.contract.checks and self.contract.overturned > 0
 
     @property
     def failed(self) -> list[CheckResult]:
@@ -130,9 +135,23 @@ class Verdict:
                 "passed": sum(r.passed for r in self.results), "failedAt": [i for i, r in enumerate(self.results) if not r.passed]}
 
 
-def parse_contract(raw: Any, source: str = "developer") -> Contract:
+def _plain(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[`\"'“”‘’]", "", text)).strip().lower()
+
+
+def cites(basis: Any, request: str) -> bool:
+    """v2: a check's basis must be words the request actually contains (quotes and spacing aside)."""
+    if not isinstance(basis, str):
+        return False
+    b = _plain(basis).strip(" .,:;!?-")
+    return len(b) >= 3 and b in _plain(request)
+
+
+def parse_contract(raw: Any, source: str = "developer", request: str | None = None) -> Contract:
     """{"checks": [{"name", "command", "expect"?, "timeout"?}, ...]} (or the bare list) -> Contract.
-    Malformed or unsafe checks are dropped and counted in `refused`; none left raises ContractError."""
+    Malformed or unsafe checks are dropped and counted in `refused`; none left raises ContractError.
+    With `request` (contract v2), every check must also quote the request in "basis", or it's dropped:
+    a check can only enforce something the user actually said."""
     items = raw.get("checks") if isinstance(raw, dict) else raw
     if not isinstance(items, list):
         raise ContractError('a contract is {"checks": [...]}')
@@ -170,8 +189,13 @@ def parse_contract(raw: Any, source: str = "developer") -> Contract:
         timeout = item.get("timeout", 60)
         if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= MAX_TIMEOUT:
             timeout = 60
+        basis = item.get("basis")
+        if request is not None and not cites(basis, request):
+            refused.append(f"check {i}: its basis isn't a quote from the request")
+            continue
         name = str(item.get("name") or command)[:MAX_NAME]
-        checks.append(Check(name=name, command=command, expect=expect or None, timeout=timeout))
+        checks.append(Check(name=name, command=command, expect=expect or None, timeout=timeout,
+                            basis=str(basis)[:300] if request is not None else None))
     if not checks:
         raise ContractError("no usable checks" + (f" ({'; '.join(refused)})" if refused else ""))
     return Contract(checks=tuple(checks), source=source, refused=tuple(refused))
@@ -200,12 +224,118 @@ Reply with JSON only, no prose:
 {{"checks": [{{"name": "short description", "command": "shell command", "expect": "optional regex"}}]}}"""
 
 
-def contract_prompt(request: str) -> str:
-    return CONTRACT_PROMPT.format(request=request.strip()[:8000], max_checks=MAX_CHECKS)
+#: Contract v2. The first benchmark showed v1's failure: the writer computed expected answers in its head
+#: (anchor slugs, sort orders, totals) and hard-coded them, so checks failed correct work. v2 checks
+#: only what the request states, each quoting the words it enforces ("basis", verified against the request).
+CONTRACT_PROMPT_V2 = """You write acceptance checks for an automated coding task. Do not do the task.
+
+Task, exactly as the user gave it:
+<<<
+{request}
+>>>
+
+Write between 2 and {max_checks} checks. Each check is a shell command run from the task's working folder after
+the agent finishes. It passes when it exits 0 and, if you give "expect", its output also matches that regex.
+
+Checks must only test what the task explicitly states. Rules:
+- Every check has a "basis": the exact words from the task that it enforces, copied verbatim. A check whose basis
+  isn't in the task is thrown away.
+- Never hard-code an answer you worked out yourself: no expected totals, orderings, formatted strings, slugs or
+  counts unless the task states that exact value. Test properties instead: a file exists where the task says, a
+  column or flag the task names is present, the program runs and exits 0, the output is valid JSON or CSV, rows
+  are in the order the task names, a round trip returns the input, a stated rule holds when the check recomputes
+  it from the input files.
+- Don't test details the task leaves open (tie-breaking, exact wording, formatting the task doesn't specify,
+  edge cases it doesn't mention).
+- Read-only: never create, change, move or delete files, and never use the network. Use python3 beyond test/grep.
+- Keep each command short and self-contained. Fewer, certain checks beat many doubtful ones.
+
+Reply with JSON only, no prose:
+{{"checks": [{{"name": "short description", "basis": "exact words from the task", "command": "shell command",
+"expect": "optional regex"}}]}}"""
 
 
-def parse_generated(text: str) -> Contract:
-    """A model's reply to contract_prompt -> Contract (tolerates code fences and stray prose)."""
+def contract_prompt(request: str, version: str = "v1") -> str:
+    template = CONTRACT_PROMPT_V2 if version == "v2" else CONTRACT_PROMPT
+    return template.format(request=request.strip()[:8000], max_checks=MAX_CHECKS)
+
+
+JUDGE_PROMPT = """You review one automatically written acceptance check that failed. The check was written by a model
+from the user's request before the work was done, and such checks are often wrong: they guess exact values,
+formats or conventions the request never stated, or test details the request leaves open.
+
+The user's request:
+<<<
+{request}
+>>>
+
+The check: {name}
+It claims to enforce: "{basis}"
+Command: {command}
+Result: {why}
+Output (end):
+{tail}
+{dispute}
+Does this failure show that the work clearly fails to do something the request states ("work")? Or could the check
+be wrong, stricter than the request, or testing something the request leaves open ("check")? Answer "work" only
+when the output shows a clear violation of what the request says.
+
+Reply with JSON only: {{"verdict": "work" or "check", "why": "one sentence"}}"""
+
+
+def _why(r: "CheckResult") -> str:
+    return r.error or (f"exited {r.exit_code}" if r.exit_code != 0 else f"output doesn't match /{r.check.expect}/")
+
+
+def judge_prompt(request: str, result: "CheckResult", dispute: str | None = None) -> str:
+    c = result.check
+    return JUDGE_PROMPT.format(request=request.strip()[:6000], name=c.name, basis=c.basis or "(none given)",
+                               command=c.command, why=_why(result), tail=result.output.strip()[-1200:] or "(none)",
+                               dispute=f"\nThe agent disputes this check: {dispute[:600]}\n" if dispute else "")
+
+
+def parse_judgment(text: Any) -> str:
+    """A judge's reply -> "work" (the work is wrong: keep the check) or "check" (drop it). Unreadable -> "work",
+    so a broken judge never silently waives a check."""
+    if not isinstance(text, str):
+        return "work"
+    m = re.search(r'"verdict"\s*:\s*"(work|check)"', text, re.I)
+    return m.group(1).lower() if m else "work"
+
+
+_DISPUTE = re.compile(r"^\s*DISPUTE:\s*(.+?)\s*(?::|-|—)\s+(.+)$", re.M)
+
+
+def parse_disputes(text: Any, contract: Contract) -> list[tuple[Check, str]]:
+    """`DISPUTE: <check name>: <why>` lines in an agent's reply -> the checks they name, with the reason."""
+    if not isinstance(text, str):
+        return []
+    found: list[tuple[Check, str]] = []
+    for m in _DISPUTE.finditer(text):
+        named = _plain(m.group(1))
+        for c in contract.checks:
+            if c not in [f[0] for f in found] and (_plain(c.name) == named or _plain(c.name).startswith(named)
+                                                   or named.startswith(_plain(c.name))):
+                found.append((c, m.group(2).strip()))
+                break
+    return found
+
+
+def without(contract: Contract, dropped: list[Check]) -> Contract:
+    """The contract minus checks a judge overturned (possibly none left: met)."""
+    keep = tuple(c for c in contract.checks if c not in dropped)
+    return Contract(checks=keep, source=contract.source, refused=contract.refused,
+                    overturned=contract.overturned + len(contract.checks) - len(keep))
+
+
+def restrict(verdict: "Verdict", contract: Contract) -> "Verdict":
+    """A verdict's results for the checks still in `contract` (no re-run)."""
+    return Verdict(contract, [r for r in verdict.results if r.check in contract.checks])
+
+
+def parse_generated(text: str, request: str | None = None) -> Contract:
+    """A model's reply to contract_prompt -> Contract (tolerates code fences and stray prose).
+    With `request` (v2), checks must quote it (parse_contract)."""
     if not isinstance(text, str):
         raise ContractError("no reply")
     body = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.I)
@@ -216,7 +346,7 @@ def parse_generated(text: str) -> Contract:
         raw = json.loads(body[start:end + 1])
     except ValueError as e:
         raise ContractError(f"the reply isn't valid JSON: {e}") from e
-    return parse_contract(raw, source="generated")
+    return parse_contract(raw, source="generated", request=request)
 
 
 def run_checks(contract: Contract, executor: Executor) -> Verdict:
@@ -235,15 +365,23 @@ def run_checks(contract: Contract, executor: Executor) -> Verdict:
     return verdict
 
 
-def failure_message(verdict: Verdict) -> str:
-    """The follow-up for a run whose contract failed: exactly what failed, nothing generic."""
+def failure_message(verdict: Verdict, disputable: bool = False) -> str:
+    """The follow-up for a run whose contract failed: exactly what failed, nothing generic. With
+    `disputable` (v2), the agent is told the checks can be wrong and how to dispute one."""
     lines = [f"{MARKER} The task isn't finished yet. These acceptance checks fail when run in your working folder:"]
     for r in verdict.failed:
-        why = (r.error or (f"exited {r.exit_code}" if r.exit_code != 0 else f"output doesn't match /{r.check.expect}/"))
         tail = r.output.strip()[-600:]
-        lines.append(f"\n- {r.check.name}\n  command: {r.check.command}\n  result: {why}" +
+        lines.append(f"\n- {r.check.name}\n  command: {r.check.command}\n  result: {_why(r)}" +
+                     (f"\n  checks this part of the request: \"{r.check.basis}\"" if r.check.basis else "") +
                      (f"\n  output (end):\n{tail}" if tail else ""))
-    lines.append("\nFix the work so these pass - change your deliverables, not the checks - then give your final "
-                 "answer again in full.")
+    if disputable:
+        lines.append("\nThese checks were written automatically from the request before you started, and they can be "
+                     "wrong. Fix any real gap between your work and what the request asks. If a check demands something "
+                     "the request didn't ask for, don't change correct work to satisfy it: leave that part as it is "
+                     "and add a line `DISPUTE: <check name>: <why>` to your final answer. Then give your final answer "
+                     "again in full.")
+    else:
+        lines.append("\nFix the work so these pass - change your deliverables, not the checks - then give your final "
+                     "answer again in full.")
     message = "\n".join(lines)
     return message if len(message) <= MESSAGE_LIMIT else message[:MESSAGE_LIMIT - 40] + "\n...[more failures omitted]"

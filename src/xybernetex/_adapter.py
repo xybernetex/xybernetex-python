@@ -15,7 +15,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .core.authz import AuthorizationTracker
-from .core.contracts import Contract, ContractError, Verdict, failure_message, parse_contract, parse_generated, run_checks
+from .core.contracts import (Contract, ContractError, Verdict, failure_message, judge_prompt, parse_contract,
+                             parse_disputes, parse_generated, parse_judgment, restrict, run_checks, without)
 from .core.ratchet import REGRESSED, ROLLED_BACK, judge, passing, rollback_message
 from .core.control import ToolGate
 from .core.followups import RunSummary, decide_local, is_ours
@@ -43,6 +44,8 @@ class Report:
     ratchet: list = field(default_factory=list)   # per fix round: improved | same | regressed | rolled-back
     governor: str | None = None             # why the governor stopped the run, if it did
     final_verdict: Any = None               # the checks on the workspace the run ended with
+    judgments: list = field(default_factory=list)  # contract v2: a judge's rulings on failed or disputed checks
+    judge_tokens: int = 0                   # what those rulings cost
 
     @property
     def contract_met(self) -> bool | None:
@@ -274,11 +277,46 @@ class ContractMixin:
                      "contract": contract.hash, "checks": len(contract.checks), "refused": len(contract.refused)})
 
     @staticmethod
-    def _parse_reply(reply: Any) -> tuple[Contract | None, str | None]:
+    def _parse_reply(reply: Any, request: str | None = None) -> tuple[Contract | None, str | None]:
         try:
-            return parse_generated(reply if isinstance(reply, str) else str(reply or "")), None
+            return parse_generated(reply if isinstance(reply, str) else str(reply or ""), request), None
         except ContractError as e:
             return None, str(e)
+
+    async def _ask(self, model: Any, prompt: str) -> tuple[str | None, int | None]:
+        """One tool-less model call: (reply text, tokens). Each adapter implements it."""
+        raise NotImplementedError
+
+    def _reply_text(self, report: Report | None) -> str | None:
+        """The final text of a turn's reply. Each adapter implements it."""
+        raise NotImplementedError
+
+    async def _adjudicate(self, session_key: str, report: Report, request: str, verdict: Verdict, judge_model: Any,
+                          round_no: int, disputes: list | None = None) -> Verdict:
+        """Contract v2: a judge model rules on each failed check (round 0) or each disputed one (a fix round):
+        is the work wrong, or the check? Overturned checks leave the contract; the verdict is restricted to
+        what remains (no re-run). A judge that can't answer keeps the check."""
+        by_check = {r.check: r for r in verdict.results}
+        targets = ([(by_check[c], why) for c, why in disputes if c in by_check] if disputes is not None
+                   else [(r, None) for r in verdict.failed])
+        overturned = []
+        for result, dispute in targets:
+            try:
+                text, tokens = await self._ask(judge_model, judge_prompt(request, result, dispute))
+            except Exception:  # noqa: BLE001 - no ruling: the check stands
+                text, tokens = None, None
+            ruling = parse_judgment(text)
+            report.judge_tokens += tokens or 0
+            index = verdict.contract.checks.index(result.check)
+            report.judgments.append({"round": round_no, "check": index, "ruling": ruling,
+                                     "disputed": dispute is not None, "passed": result.passed})
+            self._write({"type": "contract_judged", "sessionKey": session_key, "round": round_no, "check": index,
+                         "ruling": ruling, "disputed": dispute is not None})
+            if ruling == "check":
+                overturned.append(result.check)
+        if not overturned:
+            return verdict
+        return restrict(verdict, without(verdict.contract, overturned))
 
     async def _check_contract(self, session_key: str, contract: Contract, executor: Any, round_no: int) -> Verdict:
         verdict = await asyncio.to_thread(run_checks, contract, executor)
@@ -294,15 +332,19 @@ class ContractMixin:
         return decision
 
     @staticmethod
-    def _fix_message(verdict: Verdict) -> str:
-        return failure_message(verdict)
+    def _fix_message(verdict: Verdict, disputable: bool = False) -> str:
+        return failure_message(verdict, disputable)
 
     async def _fix_rounds(self, session_key: str, report: Report, contract: Contract, executor: Any, verdict: Verdict,
-                          max_fixes: int, snapshots: Any, turn: Any) -> Report | None:
+                          max_fixes: int, snapshots: Any, turn: Any, judge_model: Any = None,
+                          request: str | None = None) -> Report | None:
         """Fix turns under the ratchet (core/ratchet.py): snapshot, `turn(message)` (the adapter's
         one fix turn, which keeps its own history), check, then keep or restore. Stops when the
-        contract is met, the turn produced nothing, or max_fixes rounds have run."""
-        best, last, message = verdict, None, self._fix_message(verdict)
+        contract is met, the turn produced nothing, or max_fixes rounds have run. With a judge
+        (contract v2), the agent may dispute a check; the judge decides, and an overturned check
+        leaves the contract before the round is judged."""
+        v2 = judge_model is not None and request is not None
+        best, last, message = verdict, None, self._fix_message(verdict, v2)
         for round_no in range(1, max_fixes + 1):
             if self._stopped(session_key):
                 break
@@ -315,6 +357,11 @@ class ContractMixin:
                                  "error": f"{type(e).__name__}"})
             last = await turn(message)
             new = await self._check_contract(session_key, contract, executor, round_no)
+            if v2:
+                disputes = parse_disputes(self._reply_text(last), contract)
+                if disputes:
+                    new = await self._adjudicate(session_key, report, request, new, judge_model, round_no, disputes)
+                    contract, best = new.contract, restrict(best, new.contract)
             report.verdicts.append(new)
             outcome = judge(best, new)
             if outcome == REGRESSED and token is not None:
@@ -325,7 +372,7 @@ class ContractMixin:
                     self._write({"type": "restore_failed", "sessionKey": session_key, "round": round_no,
                                  "error": f"{type(e).__name__}"})
             if outcome != ROLLED_BACK:
-                best, message = new, self._fix_message(new)
+                best, message = new, self._fix_message(new, v2)
             if token is not None:
                 try:
                     await asyncio.to_thread(snapshots.discard, token)
