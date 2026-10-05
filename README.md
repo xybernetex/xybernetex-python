@@ -178,6 +178,38 @@ the ratchet: a fix that makes a passing check fail is undone and the agent
 is told, so a run's progress only goes up. `after_first=` lets you grade or
 snapshot the first turn before anything else touches the workspace.
 
+### Contract v2: checks that can be wrong, and a judge
+
+In our first benchmark, model-written checks (v1) often encoded expected
+values the request never stated, failed correct work, and the fix turns then
+broke it. v2 treats generated checks as fallible:
+
+```python
+report = await xyb.run(agent, "Write report.csv ...", session_key="s",
+                       contract="auto", contract_version="v2",
+                       judge_model=stronger_model,   # rules on failed checks
+                       run_checks=run_in_workspace, snapshots=FolderSnapshots(workdir))
+report.judgments         # each ruling: the work was wrong, or the check was
+```
+
+- Every check must quote the words of the request it enforces ("basis"); a
+  check whose quote isn't in the request is dropped by plain string matching.
+- Checks test properties the request states, never answers the writer worked
+  out itself.
+- Before any fix turn, the judge model rules on each failed check. Checks it
+  overturns leave the contract; if none are left, the run is done.
+- The fix message tells the agent the checks can be wrong. A
+  `DISPUTE: <check>: <why>` line in its reply sends that check to the judge
+  instead of being obeyed.
+
+Only generated contracts are judged; a developer's checks stay authoritative.
+On 12 hard tasks in each of two frameworks (GLM-5.3 Flash agents, DeepSeek V4
+Pro judge), v2 broke none of 20 correct first tries (v1 broke 4 of 19) and
+with the OpenAI Agents SDK went from 10 to 11 tasks at $0.07 per completed
+task, against $0.18 for a check-your-work turn on every run. That's 12 tasks
+an arm: encouraging, not proof. Reasoning models may need a low reasoning
+effort to write a contract at all (`contract_settings=` on the SDK adapter).
+
 ## The governor
 
 ```python
